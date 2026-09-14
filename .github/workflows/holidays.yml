@@ -15,7 +15,7 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, re, urllib.request, urllib.error
+          import json, os, re, time, urllib.request, urllib.error
 
           SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
           KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
@@ -27,54 +27,69 @@ jobs:
                   headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
                            "Content-Type": "application/json", "Prefer": prefer},
                   method=method)
-              try:
-                  with urllib.request.urlopen(req, timeout=40) as r:
-                      body = r.read()
-                      return json.loads(body) if body.strip() else None
-              except urllib.error.HTTPError as e:
-                  raise RuntimeError(f"Supabase {method} {path} -> {e.code}: {e.read()[:300]!r}")
+              last = None
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=40) as r:
+                          body = r.read()
+                          return json.loads(body) if body.strip() else None
+                  except urllib.error.HTTPError as e:
+                      last = f"{e.code}: {e.read()[:200]!r}"
+                      if e.code in (502, 503, 504):
+                          time.sleep(3 * (attempt + 1)); continue
+                      raise RuntimeError(f"Supabase {method} {path} -> {last}")
+                  except Exception as e:
+                      last = f"{type(e).__name__}: {e}"
+                      time.sleep(3 * (attempt + 1))
+              raise RuntimeError(f"Supabase {method} {path} 重試三次仍失敗 -> {last}")
 
           url = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
           req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
           with urllib.request.urlopen(req, timeout=40) as r:
               data = json.loads(r.read().decode("utf-8"))
           print(f"TWSE 回傳 {len(data)} 筆")
-          if data:
-              print("欄位:", list(data[0].keys()))
 
-          rows, skipped = [], 0
+          rows, skipped = [], []
           for it in data:
-              roc = None
-              name = ""
-              for k, v in it.items():
-                  v = (v or "").strip() if isinstance(v, str) else v
-                  if isinstance(v, str) and re.fullmatch(r"\d{7}", v):
-                      roc = v
-                  elif isinstance(v, str) and len(v) > len(name) and not v.isdigit():
-                      name = v
-              if roc:
-                  rows.append({"market_date": f"{int(roc[:3])+1911}-{roc[3:5]}-{roc[5:7]}",
-                               "name": name[:100]})
-              else:
-                  skipped += 1
+              roc  = (it.get("Date") or "").strip()
+              name = (it.get("Name") or "").strip()
+              if not re.fullmatch(r"\d{7}", roc):
+                  skipped.append((roc or "?", name, "日期格式不符")); continue
+              # TWSE 這張表混了「開始交易日 / 最後交易日」這種『有開盤』的註記，要排除。
+              # 注意不能只比對「交易」二字——「市場無交易，僅辦理結算交割作業」是真的休市。
+              if any(k in name for k in ("開始交易", "最後交易", "交易日")):
+                  skipped.append((roc, name, "這天有開盤，不是休市日")); continue
+              rows.append({"market_date": f"{int(roc[:3])+1911}-{roc[3:5]}-{roc[5:7]}",
+                           "name": name[:100]})
 
           rows = list({r["market_date"]: r for r in rows}.values())
-          print(f"解析出 {len(rows)} 個休市日（略過 {skipped} 筆無日期）")
-          for r in sorted(rows, key=lambda x: x["market_date"]):
-              print("   ", r["market_date"], r["name"])
+          rows.sort(key=lambda x: x["market_date"])
 
-          if rows:
-              supa("holidays", "POST", rows,
+          print(f"\n判定為休市日：{len(rows)} 天")
+          for r in rows:
+              print("   ", r["market_date"], r["name"])
+          print(f"\n排除：{len(skipped)} 筆")
+          for roc, name, why in skipped:
+              print("   ", roc, name, "→", why)
+
+          # 合理性檢查：台股一年的休市日（不含週末）約 18~30 天。
+          # 數量異常代表 TWSE 改了資料格式或我的過濾失效，寧可不寫也不要汙染資料庫。
+          if not (15 <= len(rows) <= 40):
+              raise SystemExit(
+                  f"休市日數量 {len(rows)} 天不在合理範圍(15~40)，判斷資料格式可能有變，不寫入")
+
+          # 分批寫入，避免一次太多觸發 504
+          for i in range(0, len(rows), 10):
+              batch = rows[i:i+10]
+              supa("holidays", "POST", batch,
                    prefer="resolution=merge-duplicates,return=minimal")
-              print("已寫入 holidays")
+              print(f"已寫入 {i+len(batch)}/{len(rows)}")
 
           n = supa("rpc/recalc_signal_dates", "POST", {})
-          print(f"重算後有 {n} 筆訊號的進出場日被修正")
+          print(f"\n重算後有 {n} 筆訊號的進出場日被修正")
 
           nxt = supa("v_next_actions?select=company_code,company_name,action,entry_date,exit_date", "GET")
           print(f"明日行動清單: {len(nxt or [])} 筆")
           for r in (nxt or []):
               print("   ", r)
           PYEOF
-
-          
