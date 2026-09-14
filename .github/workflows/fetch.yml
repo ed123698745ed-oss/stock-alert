@@ -1,0 +1,144 @@
+name: 抓取庫藏股
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '往回抓幾天（第一次可填 120 回補歷史）'
+        required: false
+        default: '30'
+  schedule:
+    - cron: '0 10 * * 1-5'
+    - cron: '30 12 * * 1-5'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓 MOPS 庫藏股並寫入 Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DAYS: ${{ github.event.inputs.days || '30' }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, re, os, urllib.request, urllib.error, http.cookiejar, datetime
+
+          SUPA = os.environ["SUPABASE_URL"].rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"]
+          DAYS = int(os.environ.get("DAYS") or 30)
+          UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+
+          opener = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+          def web(url, data=None, headers=None, timeout=40):
+              h = {"User-Agent": UA}
+              if headers: h.update(headers)
+              req = urllib.request.Request(url, data=data, headers=h)
+              with opener.open(req, timeout=timeout) as r:
+                  return r.status, r.read()
+
+          def supa(path, method="POST", payload=None):
+              req = urllib.request.Request(
+                  f"{SUPA}/rest/v1/{path}",
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+                  headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
+                           "Content-Type": "application/json",
+                           "Prefer": "return=representation"},
+                  method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      body = r.read()
+                      return r.status, (json.loads(body) if body.strip() else None)
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f"Supabase {method} {path} -> {e.code}: {e.read()[:300]!r}")
+
+          def roc2iso(s):
+              m = re.fullmatch(r"(\d{2,3})/(\d{2})/(\d{2})", (s or "").strip())
+              return f"{int(m.group(1))+1911}-{m.group(2)}-{m.group(3)}" if m else None
+
+          run_url = (f"{os.environ.get('GITHUB_SERVER_URL','')}/"
+                     f"{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/"
+                     f"{os.environ.get('GITHUB_RUN_ID','')}")
+          trig = 'manual' if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' else 'schedule'
+          _, rows = supa("runs", "POST", {"trigger": trig, "status": "running", "run_url": run_url})
+          run_id = rows[0]["id"]
+          print(f"run id = {run_id}  (往回 {DAYS} 天)")
+
+          today = datetime.date.today()
+          start = today - datetime.timedelta(days=DAYS)
+          d2 = f"{today.year-1911}{today.month:02d}{today.day:02d}"
+          d1 = f"{start.year-1911}{start.month:02d}{start.day:02d}"
+
+          sources = []
+          total_ok = 0
+
+          for market in ("sii", "otc"):
+              src = f"mops_t35sc09_{market}"
+              info = {"source": src, "status": "failed", "rows": 0, "inserted": 0, "error": None}
+              try:
+                  payload = json.dumps({"apiName": "ajax_t35sc09", "parameters": {
+                      "d1": d1, "d2": d2, "chBox": "N", "TYPEK": market, "RD": "1",
+                      "encodeURIComponent": 1, "step": 1, "firstin": 1, "off": 1}}).encode()
+                  _, b = web("https://mops.twse.com.tw/mops/api/redirectToOld", payload,
+                             {"Content-Type": "application/json",
+                              "Origin": "https://mops.twse.com.tw",
+                              "Referer": "https://mops.twse.com.tw/mops/"})
+                  enc = json.loads(b.decode("utf-8", "replace")).get("result", {}).get("url")
+                  if not enc:
+                      raise RuntimeError("redirectToOld 未回傳加密網址")
+                  _, b2 = web(enc, headers={"Referer": "https://mops.twse.com.tw/"})
+                  html = b2.decode("utf-8", "replace")
+
+                  parsed = []
+                  for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I):
+                      td = [re.sub(r"<[^>]+>", "", x).replace("\xa0", " ").strip()
+                            for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S | re.I)]
+                      if len(td) >= 6 and re.fullmatch(r"\d{4}", td[1] or "") \
+                         and roc2iso(td[3]):
+                          parsed.append(td)
+                  info["rows"] = len(parsed)
+                  print(f"[{market}] 解析 {len(parsed)} 筆")
+
+                  for td in parsed:
+                      supa("rpc/ingest_event", "POST", {
+                          "p_source": "mops_t35sc09",
+                          "p_market": market,
+                          "p_code": td[1],
+                          "p_name": td[2],
+                          "p_event_type": "buyback_board_resolution",
+                          "p_event_date": roc2iso(td[3]),
+                          "p_summary": " | ".join(x for x in td[4:9] if x),
+                          "p_raw": {"cols": td},
+                      })
+                      info["inserted"] += 1
+                  info["status"] = "success"
+                  total_ok += 1
+              except Exception as ex:
+                  info["error"] = f"{type(ex).__name__}: {ex}"[:500]
+                  print(f"[{market}] ❌ {info['error']}")
+              sources.append(info)
+
+          supa("rpc/refresh_signal_status", "POST", {})
+
+          status = "success" if total_ok == 2 else ("partial" if total_ok else "failed")
+          supa(f"runs?id=eq.{run_id}", "PATCH",
+               {"finished_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "status": status, "sources": sources})
+
+          print("=" * 50)
+          print("執行結果:", status)
+          for s in sources:
+              print(f"  {s['source']}: {s['status']}  解析{s['rows']}筆  寫入{s['inserted']}筆"
+                    + (f"  錯誤={s['error']}" if s['error'] else ""))
+
+          _, nxt = supa("v_next_actions?select=company_code,company_name,action,entry_date,exit_date", "GET")
+          print(f"明日行動清單: {len(nxt or [])} 筆")
+          for r in (nxt or []):
+              print("   ", r)
+
+          if status == "failed":
+              raise SystemExit(1)
+          PYEOF
