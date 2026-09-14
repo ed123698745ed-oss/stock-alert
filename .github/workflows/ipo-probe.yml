@@ -7,7 +7,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: 列出全部案件並探測個案日程
+      - name: 用完整參數取個案日程
         run: |
           python3 - <<'PYEOF'
           import json, ssl, urllib.request, urllib.parse
@@ -17,9 +17,9 @@ jobs:
           BASE = "https://mopsov.twse.com.tw/server-java/apiM/ipo/interfaces/"
           CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
 
-          def call(name, body="{}", header="{}"):
+          def call(name, body="{}"):
               url = (BASE + name + "?requestBody=" + urllib.parse.quote(body)
-                     + "&requestHeader=" + urllib.parse.quote(header))
+                     + "&requestHeader=" + urllib.parse.quote("{}"))
               req = urllib.request.Request(url, data=b"", method="POST", headers={
                   "User-Agent": UA, "Accept": "*/*",
                   "Origin": "https://mopsov.twse.com.tw",
@@ -30,40 +30,19 @@ jobs:
 
           d = call("IpoQueryCase")
           rows = [x.get("data") for x in d["responseBody"]["allType"]]
-          print(f"=== 全部 {len(rows)} 筆案件 ===")
-          kinds = {}
-          for r in rows:
-              print("  ", r)
-              if len(r) >= 3:
-                  kinds[r[2]] = kinds.get(r[2], 0) + 1
-          print("\n=== 發行市場種類統計 ===")
-          for k, v in sorted(kinds.items(), key=lambda x: -x[1]):
-              print(f"  {v:3d}  {k}")
-
           ipo = [r for r in rows if len(r) >= 3 and ("初上市" in r[2] or "初上櫃" in r[2])]
-          print(f"\n=== 判定為初上市/初上櫃：{len(ipo)} 筆 ===")
-          for r in ipo:
-              print("  ", r)
+          print(f"初上市/初上櫃 {len(ipo)} 筆:", [r[0] for r in ipo])
 
-          target = ipo[0][0] if ipo else (rows[0][0] if rows else None)
-          print("\n拿來測個案日程的代號:", target)
-
-          if target:
-              for tag in ["stockNo", "companyCode", "stockCode", "co_id", "caseNo", "compId"]:
-                  body = json.dumps({tag: target})
-                  print("\n" + "=" * 60)
-                  print(f"IpoQueryFast  requestBody={body}")
-                  print("=" * 60)
-                  try:
-                      r = call("IpoQueryFast", body)
-                      rh = r.get("responseHeader", {})
-                      print("  responseHeader:", json.dumps(rh, ensure_ascii=False)[:160])
-                      if str(rh.get("resultCode")) != "200":
-                          continue
-                      rb = r.get("responseBody")
-                      print("  responseBody keys:", list(rb.keys()) if isinstance(rb, dict) else type(rb))
-                      print("  內容:", json.dumps(rb, ensure_ascii=False)[:1500])
-                      break
-                  except Exception as e:
-                      print("  ❌", type(e).__name__, e)
+          for code, name, market in ipo:
+              print("\n" + "=" * 70)
+              print(f"{code} {name}　{market}")
+              print("=" * 70)
+              try:
+                  r = call("IpoQueryFast", json.dumps({"stockNo": code, "order": "desc"}))
+                  rb = r.get("responseBody")
+                  print(" responseBody 型別:", type(rb).__name__,
+                        " keys:", list(rb.keys()) if isinstance(rb, dict) else "")
+                  print(json.dumps(rb, ensure_ascii=False, indent=1)[:3000])
+              except Exception as e:
+                  print(" ❌", type(e).__name__, e)
           PYEOF
