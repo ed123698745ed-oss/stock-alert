@@ -1,0 +1,78 @@
+name: 更新休市日
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 1 1 * *'
+
+jobs:
+  holidays:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓 TWSE 休市日並重算訊號日期
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, urllib.request, urllib.error
+
+          SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
+
+          def supa(path, method="POST", payload=None, prefer="return=representation"):
+              req = urllib.request.Request(
+                  f"{SUPA}/rest/v1/{path}",
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+                  headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
+                           "Content-Type": "application/json", "Prefer": prefer},
+                  method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      body = r.read()
+                      return json.loads(body) if body.strip() else None
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f"Supabase {method} {path} -> {e.code}: {e.read()[:300]!r}")
+
+          url = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
+          req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+          with urllib.request.urlopen(req, timeout=40) as r:
+              data = json.loads(r.read().decode("utf-8"))
+          print(f"TWSE 回傳 {len(data)} 筆")
+          if data:
+              print("欄位:", list(data[0].keys()))
+
+          rows, skipped = [], 0
+          for it in data:
+              roc = None
+              name = ""
+              for k, v in it.items():
+                  v = (v or "").strip() if isinstance(v, str) else v
+                  if isinstance(v, str) and re.fullmatch(r"\d{7}", v):
+                      roc = v
+                  elif isinstance(v, str) and len(v) > len(name) and not v.isdigit():
+                      name = v
+              if roc:
+                  rows.append({"market_date": f"{int(roc[:3])+1911}-{roc[3:5]}-{roc[5:7]}",
+                               "name": name[:100]})
+              else:
+                  skipped += 1
+
+          rows = list({r["market_date"]: r for r in rows}.values())
+          print(f"解析出 {len(rows)} 個休市日（略過 {skipped} 筆無日期）")
+          for r in sorted(rows, key=lambda x: x["market_date"]):
+              print("   ", r["market_date"], r["name"])
+
+          if rows:
+              supa("holidays", "POST", rows,
+                   prefer="resolution=merge-duplicates,return=minimal")
+              print("已寫入 holidays")
+
+          n = supa("rpc/recalc_signal_dates", "POST", {})
+          print(f"重算後有 {n} 筆訊號的進出場日被修正")
+
+          nxt = supa("v_next_actions?select=company_code,company_name,action,entry_date,exit_date", "GET")
+          print(f"明日行動清單: {len(nxt or [])} 筆")
+          for r in (nxt or []):
+              print("   ", r)
+          PYEOF
