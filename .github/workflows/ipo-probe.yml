@@ -7,7 +7,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: 用正確的 query string 格式探測 IPO
+      - name: 列出全部案件並探測個案日程
         run: |
           python3 - <<'PYEOF'
           import json, ssl, urllib.request, urllib.parse
@@ -26,76 +26,44 @@ jobs:
                   "Referer": "https://mopsov.twse.com.tw/IPO/imformationhub.html",
                   "Content-Length": "0"})
               with urllib.request.urlopen(req, context=CTX, timeout=25) as r:
-                  return r.status, r.read().decode("utf-8", "replace")
+                  return json.loads(r.read().decode("utf-8", "replace"))
 
-          def dig(o, depth=0, path=""):
-              """找出第一個 list of dict，印出欄位與前兩筆"""
-              if isinstance(o, list) and o and isinstance(o[0], dict):
-                  print(f"  路徑 {path or '(根)'} 是 list，共 {len(o)} 筆")
-                  print(f"  欄位: {list(o[0].keys())}")
-                  for x in o[:2]:
-                      print("   ", json.dumps(x, ensure_ascii=False)[:900])
-                  return True
-              if isinstance(o, dict):
-                  for k, v in o.items():
-                      if dig(v, depth + 1, f"{path}.{k}" if path else k):
-                          return True
-              return False
+          d = call("IpoQueryCase")
+          rows = [x.get("data") for x in d["responseBody"]["allType"]]
+          print(f"=== 全部 {len(rows)} 筆案件 ===")
+          kinds = {}
+          for r in rows:
+              print("  ", r)
+              if len(r) >= 3:
+                  kinds[r[2]] = kinds.get(r[2], 0) + 1
+          print("\n=== 發行市場種類統計 ===")
+          for k, v in sorted(kinds.items(), key=lambda x: -x[1]):
+              print(f"  {v:3d}  {k}")
 
-          print("=" * 64)
-          print("[1] IpoQueryCase  requestBody={}&requestHeader={}")
-          print("=" * 64)
-          case = None
-          try:
-              st, txt = call("IpoQueryCase")
-              print(" HTTP", st, " 長度", len(txt))
-              case = json.loads(txt)
-              print(" top keys:", list(case.keys()) if isinstance(case, dict) else type(case))
-              if isinstance(case, dict) and "responseHeader" in case:
-                  print(" responseHeader:", json.dumps(case["responseHeader"], ensure_ascii=False)[:200])
-              if not dig(case):
-                  print(" 沒找到 list of dict，原始前 1500 字：")
-                  print(" ", txt[:1500])
-          except Exception as e:
-              print(" ❌", type(e).__name__, e)
+          ipo = [r for r in rows if len(r) >= 3 and ("初上市" in r[2] or "初上櫃" in r[2])]
+          print(f"\n=== 判定為初上市/初上櫃：{len(ipo)} 筆 ===")
+          for r in ipo:
+              print("  ", r)
 
-          code = None
-          def find_code(o):
-              global code
-              if code: return
-              if isinstance(o, dict):
-                  for k, v in o.items():
-                      if isinstance(v, str) and v.strip().isdigit() and len(v.strip()) == 4:
-                          code = v.strip(); return
-                      find_code(v)
-              elif isinstance(o, list):
-                  for x in o[:20]: find_code(x)
-          if case: find_code(case)
-          print("\n挑到的代號:", code)
+          target = ipo[0][0] if ipo else (rows[0][0] if rows else None)
+          print("\n拿來測個案日程的代號:", target)
 
-          if code:
-              for tag, body in [
-                  ("stockNo",      json.dumps({"stockNo": code})),
-                  ("companyCode",  json.dumps({"companyCode": code})),
-                  ("stockCode",    json.dumps({"stockCode": code})),
-                  ("co_id",        json.dumps({"co_id": code})),
-              ]:
-                  print("\n" + "=" * 64)
-                  print(f"[2] IpoQueryFast  requestBody={{\"{tag}\":\"{code}\"}}")
-                  print("=" * 64)
+          if target:
+              for tag in ["stockNo", "companyCode", "stockCode", "co_id", "caseNo", "compId"]:
+                  body = json.dumps({tag: target})
+                  print("\n" + "=" * 60)
+                  print(f"IpoQueryFast  requestBody={body}")
+                  print("=" * 60)
                   try:
-                      st, txt = call("IpoQueryFast", body)
-                      print(" HTTP", st, " 長度", len(txt))
-                      d = json.loads(txt)
-                      if isinstance(d, dict) and "responseHeader" in d:
-                          rh = d["responseHeader"]
-                          print(" responseHeader:", json.dumps(rh, ensure_ascii=False)[:200])
-                          if str(rh.get("resultCode")) not in ("200", "0", "None"):
-                              continue
-                      if not dig(d):
-                          print(" 原始前 900 字：", txt[:900])
-                      else:
-                          break
+                      r = call("IpoQueryFast", body)
+                      rh = r.get("responseHeader", {})
+                      print("  responseHeader:", json.dumps(rh, ensure_ascii=False)[:160])
+                      if str(rh.get("resultCode")) != "200":
+                          continue
+                      rb = r.get("responseBody")
+                      print("  responseBody keys:", list(rb.keys()) if isinstance(rb, dict) else type(rb))
+                      print("  內容:", json.dumps(rb, ensure_ascii=False)[:1500])
+                      break
                   except Exception as e:
-                      print(" ❌", type(e).__name__, e)
+                      print("  ❌", type(e).__name__, e)
           PYEOF
