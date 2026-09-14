@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>交易提醒</title>
+<style>
+:root{
+  --bg:#f6f7f9; --card:#fff; --ink:#16181d; --dim:#6b7280; --line:#e5e7eb;
+  --buy:#d92d20; --buy-bg:#fef3f2; --sell:#047857; --sell-bg:#ecfdf5;
+  --warn:#b45309; --warn-bg:#fffbeb; --accent:#1d4ed8;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0f1115; --card:#171a21; --ink:#e8eaed; --dim:#9aa1ac; --line:#272b33;
+    --buy:#ff6b5e; --buy-bg:#2a1512; --sell:#34d399; --sell-bg:#0d2019;
+    --warn:#fbbf24; --warn-bg:#241c08; --accent:#7aa2ff;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:16px/1.5 -apple-system,BlinkMacSystemFont,"Noto Sans TC",system-ui,sans-serif;
+  padding:0 0 48px;-webkit-text-size-adjust:100%}
+.wrap{max-width:720px;margin:0 auto;padding:0 16px}
+header{position:sticky;top:0;z-index:5;background:var(--bg);
+  padding:14px 0 10px;border-bottom:1px solid var(--line)}
+.hrow{display:flex;align-items:center;justify-content:space-between;gap:12px}
+h1{font-size:19px;margin:0;letter-spacing:.02em}
+h2{font-size:15px;margin:26px 0 10px;color:var(--dim);font-weight:600;
+  letter-spacing:.08em}
+.status{font-size:13px;color:var(--dim);margin-top:6px;display:flex;
+  align-items:center;gap:6px;flex-wrap:wrap}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--sell);flex:none}
+.dot.bad{background:var(--buy)} .dot.warn{background:var(--warn)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:14px;margin-bottom:10px}
+.card.buy{border-left:4px solid var(--buy)}
+.card.sell{border-left:4px solid var(--sell)}
+.tag{display:inline-block;font-size:12px;font-weight:700;padding:3px 9px;
+  border-radius:999px;letter-spacing:.05em}
+.tag.buy{color:var(--buy);background:var(--buy-bg)}
+.tag.sell{color:var(--sell);background:var(--sell-bg)}
+.name{font-size:18px;font-weight:700;margin:8px 0 2px}
+.code{font-variant-numeric:tabular-nums;color:var(--dim);font-weight:500}
+.meta{font-size:13px;color:var(--dim);margin-top:6px;
+  font-variant-numeric:tabular-nums}
+.row{display:flex;align-items:center;gap:10px;margin-top:12px}
+label.chk{display:flex;align-items:center;gap:7px;font-size:14px;cursor:pointer;
+  user-select:none}
+input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent)}
+input[type=text],input[type=email],input[type=password],input[type=number]{
+  width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+  background:var(--bg);color:var(--ink);font-size:16px;font-family:inherit}
+button{font:inherit;font-weight:600;border:1px solid var(--line);cursor:pointer;
+  background:var(--card);color:var(--ink);padding:9px 14px;border-radius:10px}
+button.primary{background:var(--accent);color:#fff;border-color:transparent;
+  width:100%;padding:12px}
+button.small{padding:6px 11px;font-size:13px}
+.empty{color:var(--dim);font-size:14px;padding:18px 2px}
+.days{font-weight:700;font-variant-numeric:tabular-nums}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid label{font-size:13px;color:var(--dim);display:block;margin-bottom:4px}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;
+  background:var(--ink);color:var(--bg);padding:9px 18px;border-radius:999px;
+  font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
+.toast.on{opacity:1}
+#login,#setup{max-width:360px;margin:14vh auto 0;padding:0 20px}
+#login .card,#setup .card{padding:22px}
+#login h1,#setup h1{margin-bottom:4px}
+#login p,#setup p{color:var(--dim);font-size:14px;margin:0 0 18px}
+#login input,#setup input{margin-bottom:10px}
+.err{color:var(--buy);font-size:14px;margin-top:10px}
+hr{border:0;border-top:1px solid var(--line);margin:26px 0 0}
+</style>
+</head>
+<body>
+
+<div id="setup" hidden>
+  <div class="card">
+    <h1>交易提醒</h1>
+    <p>第一次使用，請貼上 Supabase 的 publishable key（只需要設定一次，會存在這台裝置的瀏覽器裡）</p>
+    <input id="key" type="text" placeholder="sb_publishable_... 或 eyJ...">
+    <button class="primary" id="btnKey">儲存</button>
+  </div>
+</div>
+
+<div id="login" hidden>
+  <div class="card">
+    <h1>交易提醒</h1>
+    <p>請登入</p>
+    <input id="email" type="email" placeholder="Email" autocomplete="username">
+    <input id="pw" type="password" placeholder="密碼" autocomplete="current-password">
+    <button class="primary" id="btnLogin">登入</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="wrap">
+      <div class="hrow">
+        <h1>交易提醒</h1>
+        <div style="display:flex;gap:8px">
+          <button class="small" id="btnRefresh">重新整理</button>
+          <button class="small" id="btnRun">更新資料</button>
+        </div>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <h2 id="actionTitle">明日行動</h2>
+    <div id="actions"></div>
+
+    <h2>進行中部位</h2>
+    <div id="holding"></div>
+
+    <hr>
+    <h2>策略設定</h2>
+    <div id="strategies"></div>
+    <p class="empty">改參數只影響之後新產生的訊號，已經存在的訊號和部位不會變動。</p>
+
+    <p class="empty" style="text-align:center">
+      <button class="small" id="btnLogout">登出</button>
+    </p>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+const SUPABASE_URL = "https://cvjjzboacbileqikwgcy.supabase.co";
+const GITHUB_ACTION_URL =
+  "https://github.com/ed123698745ed-oss/stock-alert/actions/workflows/fetch.yml";
+
+const $ = id => document.getElementById(id);
+let SUPABASE_KEY = "";
+try { SUPABASE_KEY = localStorage.getItem("sb_key") || ""; } catch(e){}
+const sb = SUPABASE_KEY ? supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+const W = ["日","一","二","三","四","五","六"];
+
+function fmt(d){
+  if(!d) return "—";
+  const t = new Date(d + "T00:00:00");
+  return `${t.getMonth()+1}/${t.getDate()}(${W[t.getDay()]})`;
+}
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+let toastTimer;
+function toast(msg){
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("on");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("on"), 1600);
+}
+
+$("btnKey").onclick = () => {
+  const v = $("key").value.trim();
+  if(!v) return;
+  try { localStorage.setItem("sb_key", v); } catch(e){}
+  location.reload();
+};
+
+async function boot(){
+  if(!sb){ $("setup").hidden = false; return; }
+  const { data:{ session } } = await sb.auth.getSession();
+  if(session){ $("login").hidden = true; $("app").hidden = false; load(); }
+  else { $("app").hidden = true; $("login").hidden = false; }
+}
+$("btnLogin").onclick = async () => {
+  $("loginErr").textContent = "";
+  const { error } = await sb.auth.signInWithPassword({
+    email: $("email").value.trim(), password: $("pw").value });
+  if(error) $("loginErr").textContent = "登入失敗：" + error.message;
+  else boot();
+};
+$("pw").addEventListener("keydown", e => { if(e.key === "Enter") $("btnLogin").click(); });
+$("btnLogout").onclick = async () => { await sb.auth.signOut(); boot(); };
+$("btnRefresh").onclick = () => load();
+$("btnRun").onclick = () => window.open(GITHUB_ACTION_URL, "_blank");
+
+async function load(){
+  const [act, hold, run, stg] = await Promise.all([
+    sb.from("v_next_actions").select("*"),
+    sb.from("v_holding").select("*"),
+    sb.from("runs").select("*").order("started_at",{ascending:false}).limit(1),
+    sb.from("strategies").select("*").order("name"),
+  ]);
+  const err = act.error || hold.error || run.error || stg.error;
+  if(err){ $("actions").innerHTML =
+    `<div class="card">讀取失敗：${esc(err.message)}</div>`; return; }
+
+  renderStatus(run.data?.[0]);
+  renderActions(act.data || []);
+  renderHolding(hold.data || []);
+  renderStrategies(stg.data || []);
+}
+
+function renderStatus(r){
+  const el = $("status");
+  if(!r){ el.innerHTML = `<span class="dot warn"></span>尚無執行紀錄`; return; }
+  const t = new Date(r.finished_at || r.started_at);
+  const hrs = (Date.now() - t) / 36e5;
+  const label = { success:"正常", partial:"部分失敗", failed:"失敗",
+                  running:"執行中" }[r.status] || r.status;
+  let cls = r.status === "success" ? "" : (r.status === "running" ? "warn" : "bad");
+  let stale = "";
+  if(hrs > 48 && r.status === "success"){ cls = "warn"; stale = "（資料可能過期）"; }
+  const ts = `${t.getMonth()+1}/${t.getDate()} ` +
+    `${String(t.getHours()).padStart(2,"0")}:${String(t.getMinutes()).padStart(2,"0")}`;
+  el.innerHTML = `<span class="dot ${cls}"></span>最後更新 ${ts}・${label}${stale}`;
+}
+
+function renderActions(rows){
+  const box = $("actions");
+  if(!rows.length){
+    box.innerHTML = `<div class="empty">下一個交易日沒有要進場或出場的標的。</div>`;
+    $("actionTitle").textContent = "明日行動";
+    return;
+  }
+  const d = rows[0].action === "entry" ? rows[0].entry_date : rows[0].exit_date;
+  $("actionTitle").textContent = `明日行動　${fmt(d)}`;
+  rows.sort((a,b) => (a.action === "exit" ? -1 : 1) - (b.action === "exit" ? -1 : 1));
+  box.innerHTML = rows.map(r => {
+    const isBuy = r.action === "entry";
+    const when = isBuy
+      ? `${fmt(r.entry_date)} ${r.entry_timing === "open" ? "開盤" : "收盤"}買進`
+      : `${fmt(r.exit_date)} ${r.exit_timing === "open" ? "開盤" : "收盤"}賣出`;
+    return `
+    <div class="card ${isBuy ? "buy" : "sell"}">
+      <span class="tag ${isBuy ? "buy" : "sell"}">${isBuy ? "買進" : "賣出"}</span>
+      <span class="tag" style="color:var(--dim)">${esc(r.strategy_name)}</span>
+      <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span></div>
+      <div class="meta">${when}</div>
+      <div class="meta">決議日 ${fmt(r.event_date)}　
+        ${isBuy ? "預計出場 " + fmt(r.exit_date) : "進場日 " + fmt(r.entry_date)}</div>
+      ${noteBlock(r)}
+    </div>`;
+  }).join("");
+  bindRows(box);
+}
+
+function renderHolding(rows){
+  const box = $("holding");
+  if(!rows.length){
+    box.innerHTML = `<div class="empty">目前沒有進行中的部位。</div>`; return;
+  }
+  box.innerHTML = rows.map(r => `
+    <div class="card">
+      <span class="tag" style="color:var(--dim)">${esc(r.strategy_name)}</span>
+      <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span></div>
+      <div class="meta">${fmt(r.entry_date)} 進場　→　出場 <span class="days">${fmt(r.exit_date)}</span>
+        ${r.exit_timing === "open" ? "開盤" : "收盤"}</div>
+      ${noteBlock(r)}
+    </div>`).join("");
+  bindRows(box);
+}
+
+function noteBlock(r){
+  return `
+    <div class="row">
+      <label class="chk">
+        <input type="checkbox" data-id="${r.id}" data-f="checked" ${r.checked ? "checked" : ""}>
+        已處理
+      </label>
+      <button class="small" data-ignore="${r.id}">忽略</button>
+    </div>
+    <div class="row">
+      <input type="text" placeholder="備註" data-id="${r.id}" data-f="note"
+             value="${esc(r.note || "")}">
+    </div>`;
+}
+
+function bindRows(box){
+  box.querySelectorAll('input[type=checkbox][data-f]').forEach(el => {
+    el.onchange = () => save(el.dataset.id, { checked: el.checked });
+  });
+  box.querySelectorAll('input[type=text][data-f=note]').forEach(el => {
+    el.onchange = () => save(el.dataset.id, { note: el.value });
+  });
+  box.querySelectorAll('button[data-ignore]').forEach(el => {
+    el.onclick = async () => {
+      await save(el.dataset.ignore, { ignored: true }, "已忽略"); load();
+    };
+  });
+}
+
+async function save(id, patch, msg){
+  const { error } = await sb.from("signals").update(patch).eq("id", id);
+  toast(error ? "儲存失敗：" + error.message : (msg || "已同步"));
+}
+
+function renderStrategies(rows){
+  $("strategies").innerHTML = rows.map(s => `
+    <div class="card">
+      <div class="name" style="font-size:16px">${esc(s.name)}
+        <span class="code">${esc(s.code)}</span></div>
+      <div class="grid" style="margin-top:12px">
+        <div><label>事件後第幾個交易日進場</label>
+          <input type="number" min="0" max="60" data-s="${esc(s.code)}"
+                 data-f="entry_offset" value="${s.entry_offset}"></div>
+        <div><label>持有幾個交易日（含進場日）</label>
+          <input type="number" min="1" max="250" data-s="${esc(s.code)}"
+                 data-f="holding_days" value="${s.holding_days}"></div>
+      </div>
+      <div class="row">
+        <label class="chk">
+          <input type="checkbox" data-s="${esc(s.code)}" data-f="enabled"
+                 ${s.enabled ? "checked" : ""}> 啟用
+        </label>
+        <span class="meta">進場 ${s.entry_timing === "open" ? "開盤" : "收盤"}
+          ・出場 ${s.exit_timing === "open" ? "開盤" : "收盤"}</span>
+      </div>
+    </div>`).join("");
+
+  $("strategies").querySelectorAll("[data-s]").forEach(el => {
+    el.onchange = async () => {
+      const v = el.type === "checkbox" ? el.checked : Number(el.value);
+      const { error } = await sb.from("strategies")
+        .update({ [el.dataset.f]: v, updated_at: new Date().toISOString() })
+        .eq("code", el.dataset.s);
+      toast(error ? "儲存失敗：" + error.message : "已更新策略參數");
+    };
+  });
+}
+
+document.addEventListener("visibilitychange", () => {
+  if(!document.hidden && !$("app").hidden) load();
+});
+
+boot();
+</script>
+</body>
+</html>
