@@ -27,10 +27,12 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove("on"), 2200);
 }
 
+// ---------- 動態插入新區塊與樣式（index.html 不用改）----------
 function ensureSections() {
   if ($("split")) return;
   document.head.insertAdjacentHTML("beforeend", `<style>
-    .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0 4px}
+    .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(62px,1fr));
+      gap:8px;margin:14px 0 4px}
     .kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;
       padding:10px 8px;text-align:center}
     .kpi b{display:block;font-size:21px;font-variant-numeric:tabular-nums;line-height:1.2}
@@ -57,10 +59,12 @@ function ensureSections() {
   $("actionTitle").insertAdjacentHTML("beforebegin", `<div class="kpis" id="kpis"></div>`);
   $("holding").insertAdjacentHTML("afterend", `
     <h2>分割追蹤</h2><div id="split"></div>
+    <h2 id="ipoTitle">IPO 新股</h2><div id="ipos"></div>
     <h2>處置股</h2><div id="disposals"></div>
     <h2 id="detTitle">新偵測公告</h2><div id="detections"></div>`);
 }
 
+// ---------- 金鑰 / 登入 ----------
 $("btnKey").onclick = () => {
   const v = $("key").value.trim();
   if (!v) return;
@@ -88,10 +92,11 @@ $("btnLogout").onclick = async () => { await sb.auth.signOut(); boot(); };
 $("btnRefresh").onclick = () => load();
 $("btnRun").onclick = () => window.open(GH, "_blank");
 
+// ---------- 載入 ----------
 async function load() {
   const today = iso(new Date());
   const until = iso(new Date(Date.now() + 400 * 864e5));
-  const [act, hold, run, stg, cal, dsp, spl, det] = await Promise.all([
+  const [act, hold, run, stg, cal, dsp, spl, det, ipo] = await Promise.all([
     sb.from("v_next_actions").select("*"),
     sb.from("v_holding").select("*"),
     sb.from("runs").select("*").order("started_at", { ascending: false }).limit(1),
@@ -102,8 +107,9 @@ async function load() {
     sb.from("v_split").select("*"),
     sb.from("detections").select("*").eq("handled", false)
       .order("detected_date", { ascending: false }).limit(30),
+    sb.from("v_ipos").select("*"),
   ]);
-  const err = [act, hold, run, stg, cal, dsp, spl, det].map(r => r.error).find(Boolean);
+  const err = [act, hold, run, stg, cal, dsp, spl, det, ipo].map(r => r.error).find(Boolean);
   if (err) {
     $("actions").innerHTML = `<div class="card">讀取失敗：${esc(err.message)}</div>`;
     return;
@@ -115,20 +121,24 @@ async function load() {
   renderCalendar(CAL);
   renderHolding(hold.data || []);
   renderSplit(spl.data || []);
+  renderIpos(ipo.data || []);
   renderDisposals(dsp.data || []);
   renderDetections(det.data || []);
   renderStrategies(STG);
-  renderKpis(act.data || [], hold.data || [], dsp.data || [], det.data || []);
+  renderKpis(act.data || [], hold.data || [], dsp.data || [], det.data || [], ipo.data || []);
   fillForm();
 }
 
-function renderKpis(act, hold, dsp, det) {
+function renderKpis(act, hold, dsp, det, ipo) {
   const inDisp = dsp.filter(d => d.grp === "處置中").length;
   const focus = dsp.filter(d => d.is_focus).length;
+  const ipoOpen = ipo.filter(r => r.grp !== "已掛牌").length;
+  const ipoHot = ipo.filter(r => r.grp === "今日重點").length;
   $("kpis").innerHTML = `
     <div class="kpi ${act.length ? "hot" : ""}"><b>${act.length}</b><span>明日行動</span></div>
     <div class="kpi"><b>${hold.length}</b><span>進行中部位</span></div>
     <div class="kpi"><b>${inDisp}</b><span>處置中${focus ? `・${focus}★` : ""}</span></div>
+    <div class="kpi ${ipoHot ? "hot" : ""}"><b>${ipoOpen}</b><span>IPO${ipoHot ? `・${ipoHot}★` : ""}</span></div>
     <div class="kpi ${det.length ? "hot" : ""}"><b>${det.length}</b><span>待看公告</span></div>`;
 }
 
@@ -146,6 +156,7 @@ function renderStatus(r) {
   el.innerHTML = `<span class="dot ${cls}"></span>最後更新 ${ts}・${label}${stale}`;
 }
 
+// ---------- 明日行動 ----------
 function renderActions(rows) {
   const box = $("actions");
   if (!rows.length) {
@@ -167,7 +178,7 @@ function renderActions(rows) {
       <span class="tag" style="color:var(--dim)">${esc(r.strategy_name)}</span>
       <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span></div>
       <div class="meta">${when}</div>
-      <div class="meta">事件日 ${fmt(r.event_date)}　
+      <div class="meta">事件日 ${fmt(r.event_date)}
         ${isBuy ? "預計出場 " + fmt(r.exit_date) : "進場日 " + fmt(r.entry_date)}</div>
       ${noteBlock("signals", r)}
     </div>`;
@@ -175,6 +186,7 @@ function renderActions(rows) {
   bindRows(box);
 }
 
+// ---------- 近期行事曆（45 天內、最多 4 筆、7 天內標黃）----------
 function renderCalendar(rows) {
   const box = $("calendar");
   const today = iso(new Date());
@@ -216,6 +228,7 @@ function renderHolding(rows) {
   bindRows(box);
 }
 
+// ---------- 分割追蹤（五節點，可就地補日期）----------
 function renderSplit(rows) {
   const box = $("split");
   if (!rows.length) { box.innerHTML = `<div class="empty">沒有追蹤中的分割標的。</div>`; return; }
@@ -262,6 +275,44 @@ function renderSplit(rows) {
   });
 }
 
+// ---------- IPO 新股（純觀察，來源：MOPS IPO 專區）----------
+function renderIpos(rows) {
+  const box = $("ipos");
+  const hot = rows.filter(r => r.grp === "今日重點").length;
+  $("ipoTitle").textContent = `IPO 新股${rows.length ? `　${rows.length}` : ""}${hot ? `　★${hot}` : ""}`;
+  if (!rows.length) { box.innerHTML = `<div class="empty">目前沒有初上市／初上櫃案件。</div>`; return; }
+  const rank = { "今日重點": 0, "進行中": 1, "已掛牌": 2 };
+  rows.sort((a, b) => (rank[a.grp] ?? 9) - (rank[b.grp] ?? 9) ||
+    String(a.listing_date || "9999").localeCompare(String(b.listing_date || "9999")));
+
+  const range = (a, b) => a && b ? `${fmt(a)}～${fmt(b)}` : "—";
+  box.innerHTML = rows.map(r => {
+    const isHot = String(r.status || "").startsWith("★");
+    const node = (label, val, on) =>
+      `<div class="node ${on ? "on" : ""}"><i>${label}</i><b>${val}</b></div>`;
+    return `
+    <div class="card mini ${isHot ? "soon" : ""}">
+      <span class="tag ${isHot ? "warn" : ""}" style="${isHot ? "" : "color:var(--dim)"}">${esc(r.status)}</span>
+      <span class="tag" style="color:var(--dim)">${esc(r.market || "")}</span>
+      ${r.underwriter ? `<span class="tag" style="color:var(--dim)">${esc(r.underwriter)}</span>` : ""}
+      <div class="name">${esc(r.company_name || "")} <span class="code">${esc(r.company_code)}</span></div>
+      <div class="meta">承銷價 <b>${r.offer_price ?? "—"}</b>
+        ・掛牌 <b>${fmt(r.listing_date)}</b>
+        ${r.next_focus ? `・下個觀察 <b>${esc(r.next_focus)}</b>` : ""}</div>
+      <div class="nodes">
+        ${node("競拍投標", range(r.auction_start, r.auction_end), !!r.auction_start)}
+        ${node("開標", r.auction_open ? fmt(r.auction_open) : "—", !!r.auction_open)}
+        ${node("申購期間", range(r.sub_start, r.sub_end), !!r.sub_start)}
+        ${node("抽籤", r.lottery_date ? fmt(r.lottery_date) : "—", !!r.lottery_date)}
+        ${node("掛牌", r.listing_date ? fmt(r.listing_date) : "—", !!r.listing_date)}
+      </div>
+      ${noteBlock("ipos", r)}
+    </div>`;
+  }).join("");
+  bindRows(box);
+}
+
+// ---------- 處置股 ----------
 function renderDisposals(rows) {
   const box = $("disposals");
   if (!rows.length) { box.innerHTML = `<div class="empty">目前沒有追蹤中的處置股。</div>`; return; }
@@ -276,7 +327,7 @@ function renderDisposals(rows) {
       ${r.is_fresh ? `<span class="tag buy">新公告</span>` : ""}
       <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span>
         <span class="code" style="font-size:12px">${esc(r.market)}</span></div>
-      <div class="meta">處置 ${fmt(r.start_date)} ～ ${fmt(r.end_date)}　
+      <div class="meta">處置 ${fmt(r.start_date)} ～ ${fmt(r.end_date)}
         ${r.next_focus ? `下個觀察 <b>${esc(r.next_focus)}</b>` : ""}</div>
       ${noteBlock("disposals", r)}
     </div>`;
@@ -293,6 +344,7 @@ function renderDisposals(rows) {
   bindRows(box);
 }
 
+// ---------- 新偵測公告 ----------
 function renderDetections(rows) {
   const box = $("detections");
   $("detTitle").textContent = `新偵測公告${rows.length ? `　${rows.length}` : ""}`;
@@ -323,6 +375,7 @@ function renderDetections(rows) {
   });
 }
 
+// ---------- 共用：勾選與備註 ----------
 function noteBlock(table, r) {
   return `
     <div class="row">
@@ -341,7 +394,8 @@ function noteBlock(table, r) {
 
 function bindRows(box) {
   box.querySelectorAll("input[type=checkbox][data-t]").forEach(el => {
-    el.onchange = () => saveRow(el.dataset.t, el.dataset.id, { [el.dataset.f]: el.checked });
+    el.onchange = () => saveRow(el.dataset.t, el.dataset.id,
+      { [el.dataset.f]: el.checked }, el.checked && el.dataset.f !== "checked" ? "已處理" : null);
   });
   box.querySelectorAll("input[type=text][data-f=note]").forEach(el => {
     el.onchange = () => saveRow(el.dataset.t, el.dataset.id, { note: el.value });
@@ -361,6 +415,7 @@ async function saveRow(table, id, patch, msg) {
   if (!error && (patch.handled || patch.done)) load();
 }
 
+// ---------- 手動新增 ----------
 function fillForm() {
   const sel = $("fStrategy");
   if (sel.options.length !== STG.length) {
@@ -402,6 +457,7 @@ $("btnAdd").onclick = async () => {
   load();
 };
 
+// ---------- 策略設定 ----------
 function renderStrategies(rows) {
   $("strategies").innerHTML = rows.map(s => `
     <div class="card">
