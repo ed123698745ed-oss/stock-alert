@@ -1,0 +1,256 @@
+name: 抓取IPO
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'    # 台北 08:00
+    - cron: '0 12 * * *'   # 台北 20:00
+
+jobs:
+  ipo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓 MOPS IPO 專區並寫入 Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, ssl, time, datetime, urllib.request, urllib.parse
+
+          SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
+          UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+          BASE = "https://mopsov.twse.com.tw/server-java/apiM/ipo/interfaces/"
+          CTX  = ssl.create_default_context()
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          # ---------- Supabase ----------
+          def supa(path, payload=None, method="POST"):
+              req = urllib.request.Request(
+                  f"{SUPA}/rest/v1/{path}",
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+                  headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
+                           "Content-Type": "application/json",
+                           "Prefer": "return=representation"},
+                  method=method)
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  b = r.read()
+                  return json.loads(b) if b.strip() else None
+
+          # ---------- MOPS IPO API ----------
+          # 參數放 query string，不是 body；body 必須是空的（Content-Length: 0）
+          def call(name, body="{}", tries=3):
+              url = (BASE + name + "?requestBody=" + urllib.parse.quote(body)
+                     + "&requestHeader=" + urllib.parse.quote("{}"))
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(url, data=b"", method="POST", headers={
+                          "User-Agent": UA, "Accept": "*/*",
+                          "Origin": "https://mopsov.twse.com.tw",
+                          "Referer": "https://mopsov.twse.com.tw/IPO/imformationhub.html",
+                          "Content-Length": "0"})
+                      with urllib.request.urlopen(req, context=CTX, timeout=30) as r:
+                          return json.loads(r.read().decode("utf-8", "replace"))
+                  except Exception as e:
+                      last = e
+                      if i + 1 < tries: time.sleep(2 * (i + 1))
+              raise RuntimeError(f"{name}: {type(last).__name__}: {last}")
+
+          # ---------- 日期 ----------
+          DATE_RE = re.compile(r"(\d{2,4})[/\-.年](\d{1,2})[/\-.月](\d{1,2})")
+
+          def to_date(m):
+              y, mo, d = map(int, m.groups())
+              try:
+                  return datetime.date(y + 1911 if y < 1911 else y, mo, d)
+              except ValueError:
+                  return None
+
+          def all_dates(s):
+              return [d for d in (to_date(m) for m in DATE_RE.finditer(str(s or ""))) if d]
+
+          def parse_date(s):
+              """恰好一個日期才算單一日期，避免把區間誤認成單日"""
+              ds = all_dates(s)
+              return ds[0] if len(ds) == 1 else None
+
+          def parse_range(s):
+              """回傳 (起, 迄)；不是區間就回 (None, None)"""
+              ds = all_dates(s)
+              if len(ds) == 2 and ds[1] >= ds[0]:
+                  return (ds[0], ds[1])
+              return (None, None)
+
+          def iso(d): return d.isoformat() if d else None
+
+          # ---------- 步驟一：全部案件 ----------
+          MARKETS = ("初上市", "初上櫃")     # 含「創新板初上市」；排除可轉債、現金增資、初興櫃
+
+          def walk_rows(node, out):
+              """把任何巢狀結構裡帶 data 陣列的節點蒐集出來"""
+              if isinstance(node, dict):
+                  if isinstance(node.get("data"), list) and node["data"] \
+                     and all(isinstance(x, (str, int, float, type(None))) for x in node["data"]):
+                      out.append(node)
+                  for v in node.values(): walk_rows(v, out)
+              elif isinstance(node, list):
+                  for v in node: walk_rows(v, out)
+
+          case = call("IpoQueryCase")
+          rows = []
+          walk_rows(case.get("responseBody", case), rows)
+
+          cands = []
+          seen  = set()
+          for r in rows:
+              d = [str(x or "").strip() for x in r["data"]]
+              if len(d) < 3: continue
+              code, name, market = d[0], d[1], d[2]
+              if not re.fullmatch(r"\d{4}", code): continue
+              if not any(m in market for m in MARKETS): continue
+              if code in seen: continue
+              seen.add(code)
+              cands.append({"code": code, "name": name, "market": market})
+
+          print(f"IpoQueryCase 解析 {len(rows)} 列，符合初上市／初上櫃 {len(cands)} 檔：")
+          for c in cands:
+              print(f"  {c['code']} {c['name']}　{c['market']}")
+
+          run = supa("runs", {"trigger": "schedule", "status": "running",
+                              "run_url": f"{os.environ.get('GITHUB_SERVER_URL','')}/"
+                                         f"{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/"
+                                         f"{os.environ.get('GITHUB_RUN_ID','')}"})[0]
+
+          # ---------- 步驟二：逐檔細節 ----------
+          def first_str(node, *keys):
+              """在巢狀結構裡找第一個非空的指定鍵"""
+              if isinstance(node, dict):
+                  for k in keys:
+                      v = node.get(k)
+                      if isinstance(v, (str, int, float)) and str(v).strip():
+                          return str(v).strip()
+                  for v in node.values():
+                      got = first_str(v, *keys)
+                      if got: return got
+              elif isinstance(node, list):
+                  for v in node:
+                      got = first_str(v, *keys)
+                      if got: return got
+              return None
+
+          def collect_blocks(node, out):
+              """蒐集 allData 裡 {type, fields, data} 的區塊"""
+              if isinstance(node, dict):
+                  if isinstance(node.get("fields"), list) and isinstance(node.get("data"), list):
+                      out.append(node)
+                  for v in node.values(): collect_blocks(v, out)
+              elif isinstance(node, list):
+                  for v in node: collect_blocks(v, out)
+
+          ok, fail, detail_rows = 0, [], []
+
+          for c in cands:
+              try:
+                  fast = call("IpoQueryFast", json.dumps({"stockNo": c["code"], "order": "desc"}))
+                  body = fast.get("responseBody", fast)
+
+                  rec = dict(c)
+                  rec["name"]        = first_str(body, "stockName") or c["name"]
+                  rec["case_type"]   = first_str(body, "typeExplanation3")
+                  rec["underwriter"] = first_str(body, "underWriterName")
+                  rec["listing"]     = parse_date(first_str(body, "grantStockDate"))
+                  op = first_str(body, "openPrice")
+                  rec["price"]       = float(re.sub(r"[^\d.]", "", op)) if op and re.search(r"\d", op) else None
+                  rec["state"]       = first_str(body, "state")
+
+                  blocks, raw = [], {}
+                  collect_blocks(body, blocks)
+                  rec.update(a_start=None, a_end=None, a_open=None,
+                             s_start=None, s_end=None, lottery=None)
+
+                  for b in blocks:
+                      typ   = str(b.get("type") or "").strip()
+                      pairs = list(zip([str(f or "").strip() for f in b["fields"]],
+                                       [str(v or "").strip() for v in b["data"]]))
+                      if not typ: continue
+                      raw.setdefault(typ, {}).update({k: v for k, v in pairs if v})
+
+                      is_sub  = "申購" in typ
+                      is_auc  = ("競價" in typ) or ("競拍" in typ) or ("投標" in typ)
+                      if not (is_sub or is_auc): continue      # 詢圈等只存進 raw
+
+                      period, single = (None, None), None
+                      # 先看欄位名稱
+                      for lbl, val in pairs:
+                          if "期間" in lbl or "起訖" in lbl or "起迄" in lbl:
+                              r_ = parse_range(val)
+                              if r_[0]: period = r_
+                          elif "抽籤" in lbl or "開標" in lbl or "得標" in lbl:
+                              single = single or parse_date(val)
+                      # 名稱沒中就看值的形狀
+                      if not period[0]:
+                          for _, val in pairs:
+                              r_ = parse_range(val)
+                              if r_[0]: period = r_; break
+                      if not single:
+                          for _, val in pairs:
+                              if parse_range(val)[0]: continue
+                              single = parse_date(val)
+                              if single: break
+
+                      if is_sub:
+                          rec["s_start"], rec["s_end"] = period
+                          rec["lottery"] = single
+                      else:
+                          rec["a_start"], rec["a_end"] = period
+                          rec["a_open"] = single
+
+                  supa("rpc/upsert_ipo", {
+                      "p_code": rec["code"], "p_name": rec["name"],
+                      "p_market": rec["market"], "p_case_type": rec["case_type"],
+                      "p_underwriter": rec["underwriter"],
+                      "p_listing": iso(rec["listing"]), "p_offer_price": rec["price"],
+                      "p_auction_start": iso(rec["a_start"]), "p_auction_end": iso(rec["a_end"]),
+                      "p_auction_open": iso(rec["a_open"]),
+                      "p_sub_start": iso(rec["s_start"]), "p_sub_end": iso(rec["s_end"]),
+                      "p_lottery": iso(rec["lottery"]),
+                      "p_state": rec["state"], "p_raw": raw,
+                  })
+                  ok += 1
+                  detail_rows.append(rec)
+                  print(f"  ✓ {rec['code']} {rec['name']}　承銷價 {rec['price']}　"
+                        f"掛牌 {rec['listing']}　申購 {rec['s_start']}~{rec['s_end']} 抽籤 {rec['lottery']}　"
+                        f"競拍 {rec['a_start']}~{rec['a_end']} 開標 {rec['a_open']}")
+              except Exception as e:
+                  fail.append(f"{c['code']}: {type(e).__name__}: {e}"[:300])
+                  print(f"  ❌ {c['code']} {e}")
+              time.sleep(1)
+
+          status = "success" if (cands and not fail) else ("partial" if ok else "failed")
+          supa(f"runs?id=eq.{run['id']}",
+               {"finished_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "status": status,
+                "sources": [{"source": "ipo_MOPS", "status": status,
+                             "rows": len(cands), "inserted": ok,
+                             "error": "; ".join(fail)[:400] or None}]},
+               method="PATCH")
+
+          print("=" * 50)
+          print(f"執行結果: {status}　候選 {len(cands)} 檔，寫入 {ok} 檔")
+
+          view = supa("v_ipos?select=company_code,company_name,market,underwriter,"
+                      "listing_date,offer_price,status,next_focus,grp&order=listing_date",
+                      method="GET")
+          print(f"\n目前追蹤中 {len(view or [])} 檔：")
+          for r in (view or []):
+              print(f"  {r['company_code']} {r['company_name']}　{r.get('market')}　"
+                    f"承銷價 {r.get('offer_price')}　掛牌 {r.get('listing_date')}　"
+                    f"{r.get('status')}　下個觀察 {r.get('next_focus') or '—'}")
+
+          if status == "failed":
+              raise SystemExit(1)
+          PYEOF
