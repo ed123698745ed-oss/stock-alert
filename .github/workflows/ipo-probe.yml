@@ -7,92 +7,95 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: 探測 IPO 兩支端點的回應結構
+      - name: 用正確的 query string 格式探測 IPO
         run: |
           python3 - <<'PYEOF'
           import json, ssl, urllib.request, urllib.parse
 
           UA  = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                 "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
-          REF = "https://mopsov.twse.com.tw/IPO/imformationhub.html"
-          CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
+                 "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
           BASE = "https://mopsov.twse.com.tw/server-java/apiM/ipo/interfaces/"
+          CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
 
-          def post(url, body=b"", ctype=None):
-              h = {"User-Agent": UA, "Accept": "application/json", "Referer": REF}
-              if ctype: h["Content-Type"] = ctype
-              req = urllib.request.Request(url, data=body, headers=h)
+          def call(name, body="{}", header="{}"):
+              url = (BASE + name + "?requestBody=" + urllib.parse.quote(body)
+                     + "&requestHeader=" + urllib.parse.quote(header))
+              req = urllib.request.Request(url, data=b"", method="POST", headers={
+                  "User-Agent": UA, "Accept": "*/*",
+                  "Origin": "https://mopsov.twse.com.tw",
+                  "Referer": "https://mopsov.twse.com.tw/IPO/imformationhub.html",
+                  "Content-Length": "0"})
               with urllib.request.urlopen(req, context=CTX, timeout=25) as r:
                   return r.status, r.read().decode("utf-8", "replace")
 
-          def show(tag, txt, n=1200):
-              print(f"--- {tag} ---")
-              try:
-                  d = json.loads(txt)
-              except Exception:
-                  print(" 不是 JSON，前 400 字：", txt[:400]); return None
-              if isinstance(d, dict):
-                  print(" top-level keys:", list(d.keys()))
-                  for k, v in d.items():
-                      if isinstance(v, list) and v:
-                          print(f" {k} 是 list，共 {len(v)} 筆")
-                          if isinstance(v[0], dict):
-                              print(f" 第一筆欄位: {list(v[0].keys())}")
-                              print(" 第一筆:", json.dumps(v[0], ensure_ascii=False)[:n])
-                          break
-                      elif isinstance(v, dict):
-                          print(f" {k} =", json.dumps(v, ensure_ascii=False)[:300])
-              elif isinstance(d, list):
-                  print(f" 是 list，共 {len(d)} 筆")
-                  if d and isinstance(d[0], dict):
-                      print(" 第一筆欄位:", list(d[0].keys()))
-                      print(" 第一筆:", json.dumps(d[0], ensure_ascii=False)[:n])
-              return d
+          def dig(o, depth=0, path=""):
+              """找出第一個 list of dict，印出欄位與前兩筆"""
+              if isinstance(o, list) and o and isinstance(o[0], dict):
+                  print(f"  路徑 {path or '(根)'} 是 list，共 {len(o)} 筆")
+                  print(f"  欄位: {list(o[0].keys())}")
+                  for x in o[:2]:
+                      print("   ", json.dumps(x, ensure_ascii=False)[:900])
+                  return True
+              if isinstance(o, dict):
+                  for k, v in o.items():
+                      if dig(v, depth + 1, f"{path}.{k}" if path else k):
+                          return True
+              return False
 
-          print("=" * 60)
-          print("[1] IpoQueryCase — 空 body POST")
-          print("=" * 60)
+          print("=" * 64)
+          print("[1] IpoQueryCase  requestBody={}&requestHeader={}")
+          print("=" * 64)
           case = None
           try:
-              st, txt = post(BASE + "IpoQueryCase")
+              st, txt = call("IpoQueryCase")
               print(" HTTP", st, " 長度", len(txt))
-              case = show("IpoQueryCase", txt)
+              case = json.loads(txt)
+              print(" top keys:", list(case.keys()) if isinstance(case, dict) else type(case))
+              if isinstance(case, dict) and "responseHeader" in case:
+                  print(" responseHeader:", json.dumps(case["responseHeader"], ensure_ascii=False)[:200])
+              if not dig(case):
+                  print(" 沒找到 list of dict，原始前 1500 字：")
+                  print(" ", txt[:1500])
           except Exception as e:
               print(" ❌", type(e).__name__, e)
 
-          # 從案件清單挑一檔代號，測個案日程的三種帶法
           code = None
-          if case:
-              def find_code(o):
-                  if isinstance(o, dict):
-                      for k, v in o.items():
-                          if isinstance(v, str) and v.strip().isdigit() and len(v.strip()) == 4:
-                              return v.strip()
-                          r = find_code(v)
-                          if r: return r
-                  elif isinstance(o, list):
-                      for x in o[:5]:
-                          r = find_code(x)
-                          if r: return r
-                  return None
-              code = find_code(case)
+          def find_code(o):
+              global code
+              if code: return
+              if isinstance(o, dict):
+                  for k, v in o.items():
+                      if isinstance(v, str) and v.strip().isdigit() and len(v.strip()) == 4:
+                          code = v.strip(); return
+                      find_code(v)
+              elif isinstance(o, list):
+                  for x in o[:20]: find_code(x)
+          if case: find_code(case)
           print("\n挑到的代號:", code)
 
           if code:
-              for tag, body, ctype in [
-                  ("query string", b"", None),
-                  ("urlencoded",   urllib.parse.urlencode({"stockNo": code}).encode(), "application/x-www-form-urlencoded"),
-                  ("urlencoded-json", urllib.parse.urlencode({"requestBody": json.dumps({"stockNo": code})}).encode(), "application/x-www-form-urlencoded"),
-                  ("raw json",     json.dumps({"stockNo": code}).encode(), "application/json"),
+              for tag, body in [
+                  ("stockNo",      json.dumps({"stockNo": code})),
+                  ("companyCode",  json.dumps({"companyCode": code})),
+                  ("stockCode",    json.dumps({"stockCode": code})),
+                  ("co_id",        json.dumps({"co_id": code})),
               ]:
-                  print("\n" + "=" * 60)
-                  print(f"[2] IpoQueryFast — {tag}")
-                  print("=" * 60)
-                  url = BASE + "IpoQueryFast" + (f"?stockNo={code}" if tag == "query string" else "")
+                  print("\n" + "=" * 64)
+                  print(f"[2] IpoQueryFast  requestBody={{\"{tag}\":\"{code}\"}}")
+                  print("=" * 64)
                   try:
-                      st, txt = post(url, body, ctype)
+                      st, txt = call("IpoQueryFast", body)
                       print(" HTTP", st, " 長度", len(txt))
-                      show("IpoQueryFast/" + tag, txt)
+                      d = json.loads(txt)
+                      if isinstance(d, dict) and "responseHeader" in d:
+                          rh = d["responseHeader"]
+                          print(" responseHeader:", json.dumps(rh, ensure_ascii=False)[:200])
+                          if str(rh.get("resultCode")) not in ("200", "0", "None"):
+                              continue
+                      if not dig(d):
+                          print(" 原始前 900 字：", txt[:900])
+                      else:
+                          break
                   except Exception as e:
                       print(" ❌", type(e).__name__, e)
           PYEOF
