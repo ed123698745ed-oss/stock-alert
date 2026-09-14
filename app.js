@@ -102,6 +102,9 @@ function ensureSections() {
 
   $("actionTitle").textContent = "明日重點";
   $("actionTitle").insertAdjacentHTML("beforebegin", `<div class="kpis" id="kpis"></div>`);
+  // 「進行中部位」跟各板塊的「處置中／持有中」重複，整段收起來
+  $("holding").previousElementSibling.hidden = true;
+  $("holding").hidden = true;
   $("holding").insertAdjacentHTML("afterend", `
     <hr id="blocksReady">
     <h2 class="blk" id="dspTitle" style="--c:${BLOCKS.disposal.color}">處置股</h2>
@@ -144,9 +147,8 @@ $("btnRun").onclick = () => window.open(GH, "_blank");
 // ---------- 載入 ----------
 async function load() {
   const until = iso(new Date(Date.now() + 400 * 864e5));
-  const [tmr, hold, run, stg, cal, dsp, spl, det, ipo] = await Promise.all([
+  const [tmr, run, stg, cal, dsp, spl, det, ipo] = await Promise.all([
     sb.from("v_tomorrow").select("*").order("sort_key"),
-    sb.from("v_holding").select("*"),
     sb.from("runs").select("*").order("started_at", { ascending: false }).limit(1),
     sb.from("strategies").select("*").order("name"),
     sb.from("calendar").select("*").gte("event_date", TODAY)
@@ -157,7 +159,7 @@ async function load() {
       .order("detected_date", { ascending: false }).limit(30),
     sb.from("v_ipos").select("*"),
   ]);
-  const err = [tmr, hold, run, stg, cal, dsp, spl, det, ipo].map(r => r.error).find(Boolean);
+  const err = [tmr, run, stg, cal, dsp, spl, det, ipo].map(r => r.error).find(Boolean);
   if (err) {
     $("actions").innerHTML = `<div class="card">讀取失敗：${esc(err.message)}</div>`;
     return;
@@ -171,23 +173,23 @@ async function load() {
   renderStatus(run.data?.[0]);
   renderTomorrow(tmr.data || []);
   renderCalendar(CAL);
-  renderHolding(hold.data || []);
   renderDisposals(dsp.data || []);
   renderIpos(ipo.data || []);
   renderSplit(spl.data || [], detSplit);
   renderDetections(detOther);
   renderStrategies(STG);
-  renderKpis(tmr.data || [], hold.data || [], dsp.data || [], ipo.data || [], detAll);
+  renderKpis(tmr.data || [], dsp.data || [], ipo.data || [], detAll);
   fillForm();
 }
 
-function renderKpis(tmr, hold, dsp, ipo, det) {
+function renderKpis(tmr, dsp, ipo, det) {
   const inDisp = dsp.filter(d => d.grp === "處置中").length;
-  const newDisp = dsp.filter(d => d.grp === "即將處置").length;
+  const newDisp = dsp.filter(d => d.is_new).length;
   const ipoHot = ipo.filter(r => r.grp === "今日重點").length;
+  const late = tmr.filter(r => r.due_label === "未處理").length;
   $("kpis").innerHTML = `
-    <div class="kpi ${tmr.length ? "hot" : ""}"><b>${tmr.length}</b><span>明日重點</span></div>
-    <div class="kpi"><b>${hold.length}</b><span>進行中部位</span></div>
+    <div class="kpi ${tmr.length ? "hot" : ""}"><b>${tmr.length}</b><span>待辦</span></div>
+    <div class="kpi ${late ? "hot" : ""}"><b>${late}</b><span>未處理</span></div>
     <div class="kpi ${newDisp ? "hot" : ""}"><b>${newDisp}</b><span>新處置</span></div>
     <div class="kpi"><b>${inDisp}</b><span>處置中</span></div>
     <div class="kpi ${ipoHot ? "hot" : ""}"><b>${ipo.filter(r => r.grp !== "已掛牌").length}</b><span>IPO</span></div>
@@ -212,12 +214,20 @@ function renderStatus(r) {
 function renderTomorrow(rows) {
   const box = $("actions");
   if (!rows.length) {
-    $("actionTitle").textContent = "明日重點";
-    box.innerHTML = `<div class="empty">下一個交易日沒有要注意的事。</div>`;
+    $("actionTitle").textContent = "待辦";
+    box.innerHTML = `<div class="empty">目前沒有要處理的事。</div>`;
     return;
   }
-  $("actionTitle").textContent = `明日重點　${fmt(rows[0].event_date)}`;
-  box.innerHTML = rows.map(r => {
+  const order = { "未處理": 0, "今天": 1, "明天": 2 };
+  rows.sort((a, b) => (order[a.due_label] ?? 9) - (order[b.due_label] ?? 9) ||
+    (a.act_kind === "sell" ? 0 : 1) - (b.act_kind === "sell" ? 0 : 1));
+  const late = rows.filter(r => r.due_label === "未處理").length;
+  $("actionTitle").textContent = `待辦　${rows.length}${late ? `（未處理 ${late}）` : ""}`;
+
+  const groups = {};
+  rows.forEach(r => (groups[r.due_label] = groups[r.due_label] || []).push(r));
+
+  const card = r => {
     const c = blkColor(r.block_code);
     const cls = r.act_kind === "buy" ? "buy" : (r.act_kind === "sell" ? "sell" : "");
     const actTag = r.act_kind === "buy" ? "buy" : (r.act_kind === "sell" ? "sell" : "warn");
@@ -225,11 +235,17 @@ function renderTomorrow(rows) {
     <div class="card blkline ${cls}" style="--c:${c}">
       <span class="tag ${actTag}">${esc(r.action)}</span>
       <span class="tag blk" style="--c:${c}">${esc(r.block)}</span>
+      <span class="tag" style="color:var(--dim)">${fmt(r.event_date)}</span>
       <div class="name">${esc(r.company_name || "")} <span class="code">${esc(r.company_code)}</span></div>
       <div class="meta">${esc(r.detail || "")}</div>
       ${noteBlock(r.src_table, { id: r.src_id, checked: r.checked, note: r.note })}
     </div>`;
-  }).join("");
+  };
+
+  const head = { "未處理": "未處理（日子已經到了）", "今天": "今天", "明天": "明天" };
+  box.innerHTML = ["未處理", "今天", "明天"].filter(g => groups[g]).map(g =>
+    `<h3 style="font-size:13px;color:var(--dim);margin:14px 0 8px;letter-spacing:.08em">
+       ${head[g]}　${groups[g].length}</h3>${groups[g].map(card).join("")}`).join("");
   bindRows(box);
 }
 
@@ -257,23 +273,6 @@ function renderCalendar(rows) {
         <label class="chk"><input type="checkbox" data-t="calendar" data-f="done"
           data-id="${r.id}" ${r.done ? "checked" : ""}> 已處理</label>
       </div>
-    </div>`;
-  }).join("");
-  bindRows(box);
-}
-
-function renderHolding(rows) {
-  const box = $("holding");
-  if (!rows.length) { box.innerHTML = `<div class="empty">目前沒有進行中的部位。</div>`; return; }
-  box.innerHTML = rows.map(r => {
-    const c = blkColor(r.strategy_code);
-    return `
-    <div class="card blkline" style="--c:${c}">
-      <span class="tag blk" style="--c:${c}">${esc(r.strategy_name)}</span>
-      <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span></div>
-      <div class="meta">${fmt(r.entry_date)} 進場　→　出場 <span class="days">${fmt(r.exit_date)}</span>
-        ${r.exit_timing === "open" ? "開盤" : "收盤"}</div>
-      ${noteBlock("signals", r)}
     </div>`;
   }).join("");
   bindRows(box);
