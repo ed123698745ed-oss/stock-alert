@@ -92,9 +92,9 @@ function ensureSections() {
       border:2px solid var(--line);background:var(--card);position:relative;z-index:1}
     .step.done i{background:#a78bfa;border-color:#a78bfa}
     .step.cur i{border-color:#a78bfa;border-width:3px}
-    .step u{display:block;text-decoration:none;font-size:10.5px;color:var(--dim);
+    .step u{display:block;text-decoration:none;font-size:10px;color:var(--dim);
       line-height:1.25;word-break:keep-all}
-    .step b{display:block;font-size:11px;font-variant-numeric:tabular-nums;
+    .step b{display:block;font-size:10.5px;font-variant-numeric:tabular-nums;
       font-weight:600;margin-top:3px;color:var(--dim)}
     .step.done b,.step.cur b{color:var(--ink)}
     .step.cur u{color:#a78bfa;font-weight:700}
@@ -292,7 +292,7 @@ function renderDisposals(rows) {
   rows.forEach(r => (groups[r.grp] = groups[r.grp] || []).push(r));
   // 即將處置：新公告排前面；其餘：新到舊
   (groups["即將處置"] || []).sort((a, b) =>
-    (b.is_fresh ? 1 : 0) - (a.is_fresh ? 1 : 0) ||
+    (b.is_new ? 1 : 0) - (a.is_new ? 1 : 0) ||
     String(a.start_date).localeCompare(String(b.start_date)));
   ["處置中", "出關觀察", "已再處置", "已結束"].forEach(g =>
     (groups[g] || []).sort((a, b) => String(b.start_date).localeCompare(String(a.start_date))));
@@ -310,7 +310,7 @@ function renderDisposals(rows) {
     <div class="card mini blkline ${r.is_focus ? "soon" : ""}" style="--c:${C}">
       <span class="tag ${r.is_focus ? "warn" : ""}" style="${r.is_focus ? "" : "color:var(--dim)"}">${esc(r.phase || "")}</span>
       <span class="tag" style="color:var(--dim)">${esc(r.match_mode || "")}</span>
-      ${r.is_fresh ? `<span class="tag buy">新公告</span>` : ""}
+      ${r.is_new ? `<span class="tag buy">新公告</span>` : ""}
       <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span>
         <span class="code" style="font-size:12px">${esc(r.market)}</span></div>
       <div class="meta">${period}${
@@ -410,13 +410,19 @@ function renderSplit(rows, det) {
       ["宣告拆股", r.declare_date],
       ["股東會", r.meeting_date],
       ["公告換股", r.swap_date],
-      ["新股上市", r.listing_date],
+      ["停止買賣", r.suspend_date],
+      ["上市收盤買", r.listing_date],
       ["滿5日賣出", r.sell_date],
     ];
-    let cur = steps.findIndex(s => !s[1] || s[1] > TODAY);
-    if (cur < 0) cur = steps.length;
+    // 走完的節點 = 有日期且已經過去；目前節點 = 第一個未來的日期，
+    // 全部日期都過去了就沒有「目前」，只剩沒填的節點等著補
+    let cur = steps.findIndex(s => s[1] && s[1] > TODAY);
+    if (cur < 0) {
+      const last = steps[steps.length - 1][1];
+      cur = (last && last <= TODAY) ? -1 : steps.findIndex(s => !s[1]);
+    }
     return `<div class="flow">${steps.map(([label, d], i) => {
-      const cls = i < cur ? "done" : (i === cur ? "cur" : "");
+      const cls = (d && d <= TODAY) ? "done" : (i === cur ? "cur" : "");
       return `<div class="step ${cls}"><i></i><u>${label}</u>
         <b>${d ? fmt(d) : "待補"}</b></div>`;
     }).join("")}</div>`;
