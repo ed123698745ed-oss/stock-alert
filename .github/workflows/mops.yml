@@ -1,0 +1,41 @@
+name: 測試MOPS
+on:
+  workflow_dispatch:
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -s https://ipinfo.io/json; echo
+      - run: |
+          python3 - <<'P'
+          import json,re,urllib.request,http.cookiejar,datetime
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+          op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          def get(u,d=None,h=None):
+              hh={"User-Agent":UA}
+              if h: hh.update(h)
+              with op.open(urllib.request.Request(u,data=d,headers=hh),timeout=30) as r:
+                  return r.status,r.read()
+          t=datetime.date.today(); s0=t-datetime.timedelta(days=75)
+          e=f"{t.year-1911}{t.month:02d}{t.day:02d}"; s=f"{s0.year-1911}{s0.month:02d}{s0.day:02d}"
+          for k,lab in (("sii","上市"),("otc","上櫃")):
+              print("="*50); print(f"MOPS 庫藏股 {lab}  {s}~{e}")
+              try:
+                  pl=json.dumps({"apiName":"ajax_t35sc09","parameters":{"d1":s,"d2":e,"chBox":"N","TYPEK":k,"RD":"1","encodeURIComponent":1,"step":1,"firstin":1,"off":1}}).encode()
+                  st,b=get("https://mops.twse.com.tw/mops/api/redirectToOld",pl,{"Content-Type":"application/json","Origin":"https://mops.twse.com.tw","Referer":"https://mops.twse.com.tw/mops/"})
+                  u=json.loads(b.decode("utf-8","replace")).get("result",{}).get("url")
+                  print("  步驟1 HTTP",st," 加密網址:","有" if u else "無")
+                  if not u: print("  ",b[:300]); continue
+                  st2,b2=get(u,h={"Referer":"https://mops.twse.com.tw/"})
+                  html=b2.decode("utf-8","replace"); rows=[]
+                  for tr in re.findall(r"<tr[^>]*>(.*?)</tr>",html,re.S|re.I):
+                      td=[re.sub(r"<[^>]+>","",x).strip() for x in re.findall(r"<td[^>]*>(.*?)</td>",tr,re.S|re.I)]
+                      if len(td)>=6 and re.fullmatch(r"\d{4}",td[1] or "") and re.fullmatch(r"\d{3}/\d{2}/\d{2}",td[3] or ""):
+                          rows.append(td[:5])
+                  print("  步驟2 HTTP",st2," HTML長度",len(html)," 解析筆數",len(rows))
+                  for r in rows[:3]: print("   ",r)
+                  print("  結果:","✅ 雲端可以抓" if rows else "⚠️ 連得到但0筆")
+                  if not rows: print("  ",html[:500])
+              except Exception as ex:
+                  print("  ❌",type(ex).__name__,ex)
+          P
