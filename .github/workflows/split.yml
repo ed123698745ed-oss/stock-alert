@@ -1,0 +1,141 @@
+name: 抓取分割日期
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 10 * * 1-5'   # 台北 18:00
+    - cron: '0 13 * * 1-5'   # 台北 21:00（補跑）
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓 TWSE 變更股票面額預告表並寫入 Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, ssl, time, datetime, urllib.request
+
+          SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
+          UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+          URL  = "https://www.twse.com.tw/rwd/zh/change/TWTB7U?response=json"
+          CTX  = ssl.create_default_context()
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          def supa(path, payload=None, method="POST"):
+              req = urllib.request.Request(
+                  f"{SUPA}/rest/v1/{path}",
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+                  headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
+                           "Content-Type": "application/json",
+                           "Prefer": "return=representation"},
+                  method=method)
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  b = r.read()
+                  return json.loads(b) if b.strip() else None
+
+          # TWSE 有 WAF：要帶 UA 與 Referer，失敗時拉長間隔重試
+          def get_json(url, tries=3):
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          "User-Agent": UA, "Accept": "application/json",
+                          "Referer": "https://www.twse.com.tw/zh/announcement/change/twtb7u.html"})
+                      with urllib.request.urlopen(req, context=CTX, timeout=30) as r:
+                          txt = r.read().decode("utf-8", "replace")
+                      if txt.lstrip()[:1] not in "{[":
+                          raise ValueError("回傳不是 JSON（可能被 WAF 擋）：" + txt[:120])
+                      return json.loads(txt)
+                  except Exception as e:
+                      last = e
+                      if i + 1 < tries: time.sleep(5 * (i + 1))
+              raise RuntimeError(f"{type(last).__name__}: {last}")
+
+          def roc_date(s):
+              """115/08/27 → date(2026,8,27)；也吃西元"""
+              nums = re.findall(r"\d+", str(s or ""))
+              if len(nums) != 3: return None
+              y, m, d = map(int, nums)
+              try:
+                  return datetime.date(y + 1911 if y < 1911 else y, m, d)
+              except ValueError:
+                  return None
+
+          raw = get_json(URL)
+          fields = raw.get("fields") or []
+          rows   = [dict(zip(fields, r)) for r in (raw.get("data") or [])]
+          print(f"欄位: {fields}")
+          print(f"預告表共 {len(rows)} 筆")
+
+          run = supa("runs", {"trigger": "schedule", "status": "running",
+                              "run_url": f"{os.environ.get('GITHUB_SERVER_URL','')}/"
+                                         f"{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/"
+                                         f"{os.environ.get('GITHUB_RUN_ID','')}"})[0]
+
+          ok, skipped, fail = 0, [], []
+          for r in rows:
+              code    = str(r.get("股票代號", "")).strip()
+              name    = str(r.get("名稱", "")).strip()
+              suspend = roc_date(r.get("停止買賣日期"))
+              listing = roc_date(r.get("恢復買賣日期"))   # ＝新股上市日
+              try:
+                  ratio = float(str(r.get("變更股票面額換股率", "")).strip() or 0)
+              except ValueError:
+                  ratio = 0
+
+              if not re.fullmatch(r"\d{4}", code):
+                  skipped.append(f"{code} 代號格式異常"); continue
+              if ratio <= 1:
+                  # 換股率 ≤ 1 是面額增加（股票合併），不是一拆N
+                  skipped.append(f"{code} {name} 換股率 {ratio} 非分割"); continue
+
+              try:
+                  supa("rpc/upsert_split_watch", {
+                      "p_code": code, "p_name": name, "p_ratio": int(round(ratio)),
+                      "p_listing": listing.isoformat() if listing else None,
+                      "p_suspend": suspend.isoformat() if suspend else None,
+                  })
+                  ok += 1
+                  print(f"  ✓ {code} {name}　一拆{int(round(ratio))}　"
+                        f"停止買賣 {suspend}　新股上市 {listing}")
+              except Exception as e:
+                  fail.append(f"{code}: {type(e).__name__}: {e}"[:300])
+                  print(f"  ❌ {code} {e}")
+              time.sleep(1)
+
+          for s in skipped:
+              print(f"  － 略過 {s}")
+
+          status = "failed" if (rows and not ok and fail) else ("partial" if fail else "success")
+          supa(f"runs?id=eq.{run['id']}",
+               {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "status": status,
+                "sources": [{"source": "split_TWSE_TWTB7U", "status": status,
+                             "rows": len(rows), "inserted": ok,
+                             "error": "; ".join(fail)[:400] or None}]},
+               method="PATCH")
+
+          print("=" * 50)
+          print(f"執行結果: {status}　預告表 {len(rows)} 筆，寫入 {ok} 筆，略過 {len(skipped)} 筆")
+          print("註：TWTB7U 只涵蓋上市股票，且是「預告表」只列近期未完成案件，")
+          print("　　所以要每天跑才不會漏掉。上櫃分割仍需靠重大訊息偵測後手動補日期。")
+
+          view = supa("v_split?select=company_code,company_name,ratio,suspend_date,"
+                      "listing_date,sell_date,status&order=listing_date.desc.nullslast",
+                      method="GET")
+          print(f"\n目前分割追蹤 {len(view or [])} 檔：")
+          for r in (view or []):
+              print(f"  {r['company_code']} {r['company_name']}　"
+                    f"一拆{r.get('ratio') or '—'}　停買 {r.get('suspend_date') or '—'}　"
+                    f"上市 {r.get('listing_date') or '—'}　賣出 {r.get('sell_date') or '—'}　"
+                    f"{r.get('status')}")
+
+          if status == "failed":
+              raise SystemExit(1)
+          PYEOF
