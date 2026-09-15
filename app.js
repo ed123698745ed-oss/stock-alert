@@ -37,6 +37,7 @@ const BLOCKS = {
   buyback:  { name: "庫藏股", color: "#34d399" },
   tw50:     { name: "0050",   color: "#60a5fa" },
   msci:     { name: "MSCI",   color: "#f472b6" },
+  cb:       { name: "可轉債", color: "#0d9488" },
 };
 const blkColor = c => (BLOCKS[c] || {}).color || "var(--dim)";
 
@@ -87,17 +88,17 @@ function ensureSections() {
     .step::before{content:"";position:absolute;top:13px;right:50%;width:100%;height:2px;
       background:var(--line)}
     .step:first-child::before{display:none}
-    .step.done::before{background:#a78bfa}
+    .step.done::before{background:var(--fc,#a78bfa)}
     .step i{display:block;width:18px;height:18px;border-radius:50%;margin:0 auto 7px;
       border:2px solid var(--line);background:var(--card);position:relative;z-index:1}
-    .step.done i{background:#a78bfa;border-color:#a78bfa}
-    .step.cur i{border-color:#a78bfa;border-width:3px}
+    .step.done i{background:var(--fc,#a78bfa);border-color:var(--fc,#a78bfa)}
+    .step.cur i{border-color:var(--fc,#a78bfa);border-width:3px}
     .step u{display:block;text-decoration:none;font-size:10px;color:var(--dim);
       line-height:1.25;word-break:keep-all}
     .step b{display:block;font-size:10.5px;font-variant-numeric:tabular-nums;
       font-weight:600;margin-top:3px;color:var(--dim)}
     .step.done b,.step.cur b{color:var(--ink)}
-    .step.cur u{color:#a78bfa;font-weight:700}
+    .step.cur u{color:var(--fc,#a78bfa);font-weight:700}
 
     /* 快速跳轉列 */
     .nav{display:flex;gap:6px;overflow-x:auto;margin-top:10px;padding-bottom:2px;
@@ -126,6 +127,8 @@ function ensureSections() {
     <div id="disposals"></div>
     <h2 class="blk" id="ipoTitle" style="--c:${BLOCKS.ipo.color}">IPO 新股</h2>
     <div id="ipos"></div>
+    <h2 class="blk" id="cbTitle" style="--c:${BLOCKS.cb.color}">可轉債發行</h2>
+    <div id="cb"></div>
     <h2 class="blk" id="splitTitle" style="--c:${BLOCKS.split.color}">分割策略</h2>
     <div id="split"></div>
     <h2 class="blk" id="bbTitle" style="--c:${BLOCKS.buyback.color}">庫藏股</h2>
@@ -144,6 +147,7 @@ const NAV = [
   { id: "top",      label: "待辦",   c: "var(--buy)" },
   { id: "dspTitle", label: "處置股", c: BLOCKS.disposal.color },
   { id: "ipoTitle", label: "IPO",    c: BLOCKS.ipo.color },
+  { id: "cbTitle",  label: "可轉債", c: BLOCKS.cb.color },
   { id: "splitTitle", label: "分割", c: BLOCKS.split.color },
   { id: "bbTitle",  label: "庫藏股", c: BLOCKS.buyback.color },
   { id: "idxTitle", label: "指數調整", c: BLOCKS.tw50.color },
@@ -204,7 +208,7 @@ $("btnRun").onclick = () => window.open(GH, "_blank");
 // ---------- 載入 ----------
 async function load() {
   const until = iso(new Date(Date.now() + 400 * 864e5));
-  const [tmr, run, stg, cal, dsp, spl, det, ipo, pos] = await Promise.all([
+  const [tmr, run, stg, cal, dsp, spl, det, ipo, pos, cbs] = await Promise.all([
     sb.from("v_tomorrow").select("*").order("sort_key"),
     sb.from("runs").select("*").order("started_at", { ascending: false }).limit(1),
     sb.from("strategies").select("*").order("name"),
@@ -216,8 +220,9 @@ async function load() {
       .order("detected_date", { ascending: false }).limit(30),
     sb.from("v_ipos").select("*"),
     sb.from("v_positions").select("*"),
+    sb.from("v_cb").select("*"),
   ]);
-  const err = [tmr, run, stg, cal, dsp, spl, det, ipo, pos].map(r => r.error).find(Boolean);
+  const err = [tmr, run, stg, cal, dsp, spl, det, ipo, pos, cbs].map(r => r.error).find(Boolean);
   if (err) {
     $("actions").innerHTML = `<div class="card">讀取失敗：${esc(err.message)}</div>`;
     return;
@@ -234,6 +239,7 @@ async function load() {
   renderCalendar(CAL);
   renderDisposals(dsp.data || []);
   renderIpos(ipo.data || []);
+  renderCb(cbs.data || []);
   renderSplit(spl.data || [], detSplit);
   renderPositions(POS.filter(r => r.strategy_code === "buyback"),
                   "buyback", "bbTitle", "庫藏股", BLOCKS.buyback.color);
@@ -438,7 +444,74 @@ function renderIpos(rows) {
   bindRows(box);
 }
 
-// ---------- 分割策略（偵測公告 ＋ 五節點流程圖）----------
+// ---------- 共用：節點流程圖 ----------
+//  已走過＝有日期且已經過去；目前＝第一個未來的日期；
+//  全部日期都過去了就沒有「目前」，只剩沒填的節點等著補
+function flowHtml(steps, color) {
+  let cur = steps.findIndex(s => s[1] && s[1] > TODAY);
+  if (cur < 0) {
+    const last = steps[steps.length - 1][1];
+    cur = (last && last <= TODAY) ? -1 : steps.findIndex(s => !s[1]);
+  }
+  return `<div class="flow" style="--fc:${color}">${steps.map(([label, d], i) => {
+    const cls = (d && d <= TODAY) ? "done" : (i === cur ? "cur" : "");
+    return `<div class="step ${cls}"><i></i><u>${label}</u>
+      <b>${d ? fmt(d) : "待補"}</b></div>`;
+  }).join("")}</div>`;
+}
+
+// ---------- 可轉債發行（純觀察，只看近期要發行的）----------
+function renderCb(rows) {
+  const box = $("cb");
+  const C = BLOCKS.cb.color;
+  const soonN = rows.filter(r => r.grp === "即將掛牌").length;
+  $("cbTitle").innerHTML = `可轉債發行${rows.length ? `　${rows.length}` : ""}` +
+    (soonN ? `　<span style="color:${C}">即將掛牌 ${soonN}</span>` : "");
+  navCount("cbTitle", rows.length);
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">近期沒有要發行的可轉債。</div>`;
+    return;
+  }
+  const rank = { "即將掛牌": 0, "發行作業中": 1, "凍結期中": 2, "可轉換": 3 };
+  rows.sort((a, b) => (rank[a.grp] ?? 9) - (rank[b.grp] ?? 9) ||
+    String(a.listing_date || "9999").localeCompare(String(b.listing_date || "9999")));
+
+  const card = r => {
+    const hot = String(r.status || "").startsWith("★");
+    return `
+    <div class="card mini blkline ${hot ? "soon" : ""}" style="--c:${C}">
+      <span class="tag ${hot ? "warn" : ""}" style="${hot ? "" : "color:var(--dim)"}">${esc(r.status)}</span>
+      ${r.guaranteed ? `<span class="tag" style="color:var(--dim)">${esc(r.guaranteed)}</span>` : ""}
+      ${r.amount_yi ? `<span class="tag" style="color:var(--dim)">${r.amount_yi} 億</span>` : ""}
+      <div class="name">${esc(r.cb_name || (r.stock_name || "") + " CB")}
+        <span class="code">${esc(r.cb_code || "未掛牌")}</span></div>
+      <div class="meta">正股 ${esc(r.stock_code)} ${esc(r.stock_name || "")}
+        ${r.convert_price ? `・轉換價 <b>${r.convert_price}</b>` : ""}
+        ${r.next_focus ? `・下個觀察 <b>${esc(r.next_focus)}</b>` : ""}</div>
+      ${flowHtml([
+        ["董事會決議", r.board_date],
+        ["訂價", r.pricing_date],
+        ["掛牌上櫃", r.listing_date],
+        ["轉換起始", r.convert_start],
+      ], C)}
+      ${noteBlock("cb_issues", r)}
+    </div>`;
+  };
+
+  const order = ["即將掛牌", "發行作業中", "凍結期中", "可轉換"];
+  const groups = {};
+  rows.forEach(r => (groups[r.grp] = groups[r.grp] || []).push(r));
+  box.innerHTML = order.filter(g => groups[g]).map(g => {
+    const list = groups[g];
+    const open = g === "即將掛牌" || g === "發行作業中";
+    return `<details class="grp" ${open ? "open" : ""}>
+      <summary>${g}　${list.length} 檔</summary>${list.map(card).join("")}
+    </details>`;
+  }).join("");
+  bindRows(box);
+}
+
+// ---------- 分割策略（偵測公告 ＋ 六節點流程圖）----------
 function renderSplit(rows, det) {
   const box = $("split");
   const C = BLOCKS.split.color;
@@ -472,28 +545,14 @@ function renderSplit(rows, det) {
   const rank = { buy: 0, sell: 0, hold: 1, watch: 2, other: 3 };
   rows.sort((a, b) => (rank[a.grp] ?? 9) - (rank[b.grp] ?? 9));
 
-  const flow = r => {
-    const steps = [
-      ["宣告拆股", r.declare_date],
-      ["股東會", r.meeting_date],
-      ["公告換股", r.swap_date],
-      ["停止買賣", r.suspend_date],
-      ["上市收盤買", r.listing_date],
-      ["滿5日賣出", r.sell_date],
-    ];
-    // 走完的節點 = 有日期且已經過去；目前節點 = 第一個未來的日期，
-    // 全部日期都過去了就沒有「目前」，只剩沒填的節點等著補
-    let cur = steps.findIndex(s => s[1] && s[1] > TODAY);
-    if (cur < 0) {
-      const last = steps[steps.length - 1][1];
-      cur = (last && last <= TODAY) ? -1 : steps.findIndex(s => !s[1]);
-    }
-    return `<div class="flow">${steps.map(([label, d], i) => {
-      const cls = (d && d <= TODAY) ? "done" : (i === cur ? "cur" : "");
-      return `<div class="step ${cls}"><i></i><u>${label}</u>
-        <b>${d ? fmt(d) : "待補"}</b></div>`;
-    }).join("")}</div>`;
-  };
+  const flow = r => flowHtml([
+    ["宣告拆股", r.declare_date],
+    ["股東會", r.meeting_date],
+    ["公告換股", r.swap_date],
+    ["停止買賣", r.suspend_date],
+    ["上市收盤買", r.listing_date],
+    ["滿5日賣出", r.sell_date],
+  ], C);
 
   box.innerHTML = detHtml + rows.map(r => {
     const hot = String(r.status || "").startsWith("★");
