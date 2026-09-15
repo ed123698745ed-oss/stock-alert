@@ -16,7 +16,7 @@ jobs:
         run: |
           pip install --quiet lxml
           python3 - <<'PYEOF'
-          import json, os, re, ssl, time, datetime, urllib.request, html as htmllib
+          import json, os, re, ssl, time, datetime, urllib.request, urllib.error, html as htmllib
 
           SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
           KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
@@ -34,9 +34,13 @@ jobs:
                            "Content-Type": "application/json",
                            "Prefer": "return=representation"},
                   method=method)
-              with urllib.request.urlopen(req, timeout=60) as r:
-                  b = r.read()
-                  return json.loads(b) if b.strip() else None
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      b = r.read()
+                      return json.loads(b) if b.strip() else None
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "replace")[:500]
+                  raise RuntimeError(f"HTTP {e.code} {path} → {body}") from None
 
           def get_html(url, tries=3):
               last = None
@@ -101,6 +105,9 @@ jobs:
                           contract = c[i - 1].strip()
                           short    = c[i + 1].strip()
                           if not re.fullmatch(r"[A-Z]{2,4}", contract): break
+                          # 這張表同時含股票期貨、ETF期貨與股票選擇權，
+                          # 只有期貨的中文簡稱會有「期貨」兩個字
+                          if "期貨" not in short: break
                           note(v, name=short.replace("小型", "").replace("期貨", "") or None,
                                contract=contract, mini=short.startswith("小型"))
                           n += 1
@@ -128,8 +135,12 @@ jobs:
                   c = cells(tr)
                   if len(c) < 6: continue
                   idx = next((i for i, v in enumerate(c) if CODE.fullmatch(v)), None)
-                  if idx is None: continue
+                  if idx is None or idx + 2 >= len(c): continue
                   code = c[idx]
+                  # 欄位順序：商品代碼 / 標的證券 / 證券代號 / 簡稱 / 是否為股票期貨標的 / …
+                  fut_mark = c[idx + 2].strip()
+                  if fut_mark not in ("●", "O", "○", "V"):   # 不是股票期貨標的就跳過
+                      continue
                   shares = next((v for v in c[idx + 1:] if re.fullmatch(r"[\d,]{3,}", v)), "")
                   is_mini = shares.replace(",", "") == "100"
                   crossB.setdefault(code, {"futures": False, "mini": False})
@@ -165,21 +176,19 @@ jobs:
 
           ok = 0
           if found:
-              # 標的會下市或異動，先清空再重建
+              payload = [{"code": c, "name": v["name"],
+                          "futures": v["futures"], "mini": v["mini"],
+                          "contract": v["contract"], "contract_mini": v["contract_mini"]}
+                         for c, v in sorted(found.items())]
               try:
-                  old = supa("rpc/reset_futures_underlying", {})
-                  print(f"清掉舊資料 {old} 筆")
+                  # 一次原子替換：函式裡面 delete + insert 在同一個交易完成，
+                  # 不會有清到一半失敗的中間狀態；空陣列會被函式擋下來
+                  ok = supa("rpc/replace_futures_underlying", {"p_rows": payload})
+                  ok = int(ok) if isinstance(ok, (int, str)) else len(payload)
+                  print(f"原子替換完成，寫入 {ok} 檔")
               except Exception as e:
-                  print(f"清空失敗（改為直接覆蓋）: {e}")
-              for code, v in sorted(found.items()):
-                  try:
-                      supa("rpc/upsert_futures_underlying", {
-                          "p_code": code, "p_name": v["name"],
-                          "p_futures": v["futures"], "p_mini": v["mini"],
-                          "p_contract": v["contract"], "p_contract_mini": v["contract_mini"]})
-                      ok += 1
-                  except Exception as e:
-                      print(f"  寫入失敗 {code}: {e}")
+                  print(f"❌ 寫入失敗（舊資料維持不變）: {e}")
+                  ok = 0
 
           for s in sources:
               s["inserted"] = ok if s["status"] == "success" else 0
