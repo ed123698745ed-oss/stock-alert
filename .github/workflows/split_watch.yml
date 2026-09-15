@@ -115,6 +115,7 @@ jobs:
                  ("CompanyAbbreviation", "CompanyName", "公司簡稱"),
                  ("ParValueOfCommonStock", "普通股每股面額")),
               ]
+
               for market, url, kcode, kname, kpar in BASIC:
                   info = {"source": f"split_面額對帳_{market}", "status": "failed",
                           "rows": 0, "inserted": 0, "error": None}
@@ -122,36 +123,55 @@ jobs:
                       rows = get_json(url)
                       info["rows"] = len(rows)
                       new = same = changed = skipped = 0
+
+                      # 先在本地整理成一包，再分批送。
+                      # 之前是一家打一次 RPC，1600 多家要跑 6~10 分鐘，純粹是浪費。
+                      batch = []
                       for x in rows:
                           code = pick(x, *kcode)
                           if not re.fullmatch(r"\d{4}", code): continue
                           par_text = pick(x, *kpar)
                           m = PAR_VAL.search(par_text)
                           if not m:
-                              skipped += 1        # 外幣或空白
+                              skipped += 1        # 外幣或空白，不猜
                               continue
-                          res = supa("rpc/record_par_value", {
-                              "p_code": code, "p_name": pick(x, *kname),
-                              "p_market": market, "p_value": float(m.group(1)),
-                              "p_text": par_text})
-                          if   res == "new":     new += 1
-                          elif res == "changed": changed += 1
-                          else:                  same += 1
+                          batch.append({
+                              "code": code,
+                              "name": pick(x, *kname),
+                              "market": market,
+                              "value": float(m.group(1)),
+                              "text": par_text
+                          })
+
+                      CHUNK = 400
+                      for i in range(0, len(batch), CHUNK):
+                          res = supa(
+                              "rpc/record_par_values_bulk",
+                              {"p_rows": batch[i:i + CHUNK]}
+                          ) or {}
+                          new     += int(res.get("new", 0))
+                          same    += int(res.get("same", 0))
+                          changed += int(res.get("changed", 0))
+
                       info["inserted"] = changed
                       info["status"] = "success"
                       print(f"[面額對帳 {market}] {len(rows)} 家：新建基準 {new}、"
                             f"不變 {same}、**變更 {changed}**、跳過（外幣/空白）{skipped}")
+
                   except Exception as e:
                       info["error"] = f"{type(e).__name__}: {e}"[:400]
                       print(f"[面額對帳 {market}] ❌ {info['error']}")
+
                   sources.append(info)
 
           ok = sum(1 for s in sources if s["status"] == "success")
           status = ("success" if ok == len(sources)
                     else ("partial" if ok else "failed"))
+
           supa(f"runs?id=eq.{run['id']}",
                {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "status": status, "sources": sources}, method="PATCH")
+                "status": status, "sources": sources},
+               method="PATCH")
 
           print("=" * 56)
           print(f"執行結果: {status}")
@@ -159,8 +179,12 @@ jobs:
               print(f"  {s['source']}: {s['status']} 讀{s['rows']}筆 命中{s['inserted']}筆"
                     + (f"  錯誤={s['error']}" if s["error"] else ""))
 
-          leads = supa("v_split_leads?select=company_code,company_name,market,lead_date,"
-                       "kind,confidence,ratio,subject,tracked&limit=30", method="GET")
+          leads = supa(
+              "v_split_leads?select=company_code,company_name,market,lead_date,"
+              "kind,confidence,ratio,subject,tracked&limit=30",
+              method="GET"
+          )
+
           print(f"\n待確認的分割線索 {len(leads or [])} 筆：")
           for r in (leads or []):
               print(f"  [{r['confidence']}] {r['company_code']} {r.get('company_name') or ''}"
