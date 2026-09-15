@@ -98,13 +98,28 @@ function ensureSections() {
       font-weight:600;margin-top:3px;color:var(--dim)}
     .step.done b,.step.cur b{color:var(--ink)}
     .step.cur u{color:#a78bfa;font-weight:700}
+
+    /* 快速跳轉列 */
+    .nav{display:flex;gap:6px;overflow-x:auto;margin-top:10px;padding-bottom:2px;
+      scrollbar-width:none}
+    .nav::-webkit-scrollbar{display:none}
+    .nav button{flex:none;padding:6px 12px;font-size:13px;border-radius:999px;
+      display:flex;align-items:center;gap:6px}
+    .nav button i{width:8px;height:8px;border-radius:2px;background:var(--c);
+      font-style:normal;flex:none}
+    .nav button.on{border-color:var(--ink)}
+    .nav button em{font-style:normal;font-variant-numeric:tabular-nums;
+      color:var(--dim);font-size:12px}
   </style>`);
 
   $("actionTitle").textContent = "明日重點";
   $("actionTitle").insertAdjacentHTML("beforebegin", `<div class="kpis" id="kpis"></div>`);
-  // 「進行中部位」跟各板塊的「處置中／持有中」重複，整段收起來
+  // 「進行中部位」跟各板塊的「持有中」重複，整段收起來
   $("holding").previousElementSibling.hidden = true;
   $("holding").hidden = true;
+  // 行事曆的內容全都是 0050／MSCI，搬進「指數調整」板塊
+  $("calendar").previousElementSibling.hidden = true;
+
   $("holding").insertAdjacentHTML("afterend", `
     <hr id="blocksReady">
     <h2 class="blk" id="dspTitle" style="--c:${BLOCKS.disposal.color}">處置股</h2>
@@ -113,7 +128,49 @@ function ensureSections() {
     <div id="ipos"></div>
     <h2 class="blk" id="splitTitle" style="--c:${BLOCKS.split.color}">分割策略</h2>
     <div id="split"></div>
+    <h2 class="blk" id="bbTitle" style="--c:${BLOCKS.buyback.color}">庫藏股</h2>
+    <div id="buyback"></div>
+    <h2 class="blk" id="idxTitle" style="--c:${BLOCKS.tw50.color}">指數調整</h2>
+    <div id="indexPos"></div>
+    <div id="indexCal"></div>
     <h2 id="detTitle" hidden>其他偵測公告</h2><div id="detections"></div>`);
+
+  $("indexCal").appendChild($("calendar"));
+  buildNav();
+}
+
+// ---------- 快速跳轉列 ----------
+const NAV = [
+  { id: "top",      label: "待辦",   c: "var(--buy)" },
+  { id: "dspTitle", label: "處置股", c: BLOCKS.disposal.color },
+  { id: "ipoTitle", label: "IPO",    c: BLOCKS.ipo.color },
+  { id: "splitTitle", label: "分割", c: BLOCKS.split.color },
+  { id: "bbTitle",  label: "庫藏股", c: BLOCKS.buyback.color },
+  { id: "idxTitle", label: "指數調整", c: BLOCKS.tw50.color },
+];
+
+function buildNav() {
+  $("status").insertAdjacentHTML("afterend",
+    `<div class="nav" id="nav">${NAV.map(n =>
+      `<button data-go="${n.id}"><i style="--c:${n.c}"></i>${n.label}<em data-n="${n.id}"></em></button>`
+    ).join("")}</div>`);
+
+  $("nav").querySelectorAll("[data-go]").forEach(btn => {
+    btn.onclick = () => {
+      const id = btn.dataset.go;
+      if (id === "top") { window.scrollTo({ top: 0, behavior: "smooth" }); return; }
+      const el = $(id);
+      if (!el) return;
+      const head = document.querySelector("header");
+      const y = el.getBoundingClientRect().top + window.scrollY - (head?.offsetHeight || 0) - 10;
+      window.scrollTo({ top: y, behavior: "smooth" });
+    };
+  });
+}
+
+function navCount(id, n) {
+  const el = document.querySelector(`#nav em[data-n="${id}"]`);
+  if (el) el.textContent = n ? String(n) : "";
 }
 
 // ---------- 金鑰 / 登入 ----------
@@ -147,7 +204,7 @@ $("btnRun").onclick = () => window.open(GH, "_blank");
 // ---------- 載入 ----------
 async function load() {
   const until = iso(new Date(Date.now() + 400 * 864e5));
-  const [tmr, run, stg, cal, dsp, spl, det, ipo] = await Promise.all([
+  const [tmr, run, stg, cal, dsp, spl, det, ipo, pos] = await Promise.all([
     sb.from("v_tomorrow").select("*").order("sort_key"),
     sb.from("runs").select("*").order("started_at", { ascending: false }).limit(1),
     sb.from("strategies").select("*").order("name"),
@@ -158,8 +215,9 @@ async function load() {
     sb.from("detections").select("*").eq("handled", false)
       .order("detected_date", { ascending: false }).limit(30),
     sb.from("v_ipos").select("*"),
+    sb.from("v_positions").select("*"),
   ]);
-  const err = [tmr, run, stg, cal, dsp, spl, det, ipo].map(r => r.error).find(Boolean);
+  const err = [tmr, run, stg, cal, dsp, spl, det, ipo, pos].map(r => r.error).find(Boolean);
   if (err) {
     $("actions").innerHTML = `<div class="card">讀取失敗：${esc(err.message)}</div>`;
     return;
@@ -170,12 +228,17 @@ async function load() {
   const detSplit = detAll.filter(r => r.strategy_code === "split");
   const detOther = detAll.filter(r => r.strategy_code !== "split");
 
+  const POS = pos.data || [];
   renderStatus(run.data?.[0]);
   renderTomorrow(tmr.data || []);
   renderCalendar(CAL);
   renderDisposals(dsp.data || []);
   renderIpos(ipo.data || []);
   renderSplit(spl.data || [], detSplit);
+  renderPositions(POS.filter(r => r.strategy_code === "buyback"),
+                  "buyback", "bbTitle", "庫藏股", BLOCKS.buyback.color);
+  renderPositions(POS.filter(r => ["tw50", "msci"].includes(r.strategy_code)),
+                  "indexPos", "idxTitle", "指數調整", BLOCKS.tw50.color);
   renderDetections(detOther);
   renderStrategies(STG);
   renderKpis(tmr.data || [], dsp.data || [], ipo.data || [], detAll);
@@ -215,6 +278,7 @@ function renderTomorrow(rows) {
   const box = $("actions");
   if (!rows.length) {
     $("actionTitle").textContent = "待辦";
+    navCount("top", 0);
     box.innerHTML = `<div class="empty">目前沒有要處理的事。</div>`;
     return;
   }
@@ -223,6 +287,7 @@ function renderTomorrow(rows) {
     (a.act_kind === "sell" ? 0 : 1) - (b.act_kind === "sell" ? 0 : 1));
   const late = rows.filter(r => r.due_label === "未處理").length;
   $("actionTitle").textContent = `待辦　${rows.length}${late ? `（未處理 ${late}）` : ""}`;
+  navCount("top", rows.length);
 
   const groups = {};
   rows.forEach(r => (groups[r.due_label] = groups[r.due_label] || []).push(r));
@@ -285,6 +350,7 @@ function renderDisposals(rows) {
   const fresh = rows.filter(r => r.grp === "即將處置").length;
   $("dspTitle").innerHTML = `處置股${rows.length ? `　${rows.length}` : ""}` +
     (fresh ? `　<span style="color:${C}">新 ${fresh}</span>` : "");
+  navCount("dspTitle", rows.length);
   if (!rows.length) { box.innerHTML = `<div class="empty">目前沒有追蹤中的處置股。</div>`; return; }
 
   const groups = {};
@@ -339,6 +405,7 @@ function renderIpos(rows) {
   const hot = rows.filter(r => r.grp === "今日重點").length;
   $("ipoTitle").innerHTML = `IPO 新股${rows.length ? `　${rows.length}` : ""}` +
     (hot ? `　<span style="color:${C}">★${hot}</span>` : "");
+  navCount("ipoTitle", rows.filter(r => r.grp !== "已掛牌").length);
   if (!rows.length) { box.innerHTML = `<div class="empty">目前沒有初上市／初上櫃案件。</div>`; return; }
   const rank = { "今日重點": 0, "進行中": 1, "已掛牌": 2 };
   rows.sort((a, b) => (rank[a.grp] ?? 9) - (rank[b.grp] ?? 9) ||
@@ -380,6 +447,7 @@ function renderSplit(rows, det) {
   const detections = det.filter(d => !tracked.has(d.company_code));
   $("splitTitle").innerHTML = `分割策略${rows.length ? `　${rows.length}` : ""}` +
     (detections.length ? `　<span style="color:${C}">待確認 ${detections.length}</span>` : "");
+  navCount("splitTitle", rows.filter(r => r.status !== "已完成").length + detections.length);
 
   // 1) 偵測到但還沒納入追蹤的公告
   const detHtml = detections.map(r => `
@@ -467,6 +535,51 @@ function renderSplit(rows, det) {
       if (!error) load();
     };
   });
+}
+
+// ---------- 庫藏股 / 指數調整（共用同一種卡片）----------
+function renderPositions(rows, boxId, titleId, title, color) {
+  const box = $(boxId);
+  const live = rows.filter(r => r.grp !== "已結束").length;
+  $(titleId).innerHTML = `${title}${live ? `　${live}` : ""}`;
+  navCount(titleId, live);
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">目前沒有${title}的部位。</div>`;
+    return;
+  }
+  const groups = {};
+  rows.forEach(r => (groups[r.grp] = groups[r.grp] || []).push(r));
+
+  const card = r => {
+    const c = blkColor(r.strategy_code);
+    const soon = r.grp === "持有中" && r.days_to_exit !== null && r.days_to_exit <= 2;
+    let progress = "";
+    if (r.grp === "持有中" && r.day_no && r.total_days) {
+      const pct = Math.min(100, Math.round(r.day_no / r.total_days * 100));
+      progress = `<div class="meta">持有 <b style="color:${color}">第 ${r.day_no} 天</b>
+        ／共 ${r.total_days} 個交易日</div>
+        <div class="bar"><i style="width:${pct}%;background:${color}"></i></div>`;
+    }
+    return `
+    <div class="card mini blkline ${soon ? "soon" : ""}" style="--c:${c}">
+      <span class="tag ${soon ? "warn" : ""}" style="${soon ? "" : "color:var(--dim)"}">${esc(r.grp)}</span>
+      <span class="tag blk" style="--c:${c}">${esc(r.strategy_name)}</span>
+      <div class="name">${esc(r.company_name || "")} <span class="code">${esc(r.company_code)}</span></div>
+      <div class="meta">${fmt(r.entry_date)} ${r.entry_timing === "open" ? "開盤" : "收盤"}買
+        　→　${fmt(r.exit_date)} ${r.exit_timing === "open" ? "開盤" : "收盤"}賣</div>
+      ${progress}
+      ${noteBlock("signals", r)}
+    </div>`;
+  };
+
+  box.innerHTML = ["持有中", "待進場", "已結束"].filter(g => groups[g]).map(g => {
+    const list = groups[g];
+    const open = g !== "已結束";
+    return `<details class="grp" ${open ? "open" : ""}>
+      <summary>${g}　${list.length} 檔</summary>${list.map(card).join("")}
+    </details>`;
+  }).join("");
+  bindRows(box);
 }
 
 // ---------- 其他偵測公告 ----------
