@@ -113,6 +113,52 @@ jobs:
                   else:
                       print(f"[{market}] ⚠️ 沒抓到表頭（可能是 td 當標題列）")
 
+                  # ---- 把 td[4:9] 那串裸數字組成看得懂的句子 ----
+                  # 表頭 18 欄，但資料列有 19 格：「買回價格區間」在資料列
+                  # 被拆成下限、上限兩格，所以第 8 格之後整個位移一格。
+                  # 這裡用「資料列格數 == 表頭欄數 + 1」動態判斷，兩種版型都吃。
+                  PURPOSE = {"1": "轉讓員工", "2": "股權轉換",
+                             "3": "維護信用並銷除"}
+
+                  def money(s):
+                      d = re.sub(r"[^\d]", "", s or "")
+                      if not d:
+                          return (s or "").strip()
+                      n = int(d)
+                      if n >= 10**8: return f"{n/10**8:.2f} 億元"
+                      if n >= 10**4: return f"{n/10**4:,.0f} 萬元"
+                      return f"{n:,} 元"
+
+                  def shares(s):
+                      d = re.sub(r"[^\d]", "", s or "")
+                      if not d:
+                          return (s or "").strip()
+                      n = int(d)
+                      return f"{n/10**4:,.0f} 萬股" if n >= 10**4 else f"{n:,} 股"
+
+                  def build_summary(td, nhead):
+                      def cell(k):
+                          return td[k].strip() if len(td) > k else ""
+                      shifted = nhead and len(td) == nhead + 1
+                      parts = []
+                      p = cell(4)
+                      if p:
+                          parts.append("目的 " + PURPOSE.get(p, p))
+                      if cell(6):
+                          parts.append("預定 " + shares(cell(6)))
+                      if shifted:
+                          lo, hi, period = cell(7), cell(8), cell(9)
+                          price = f"{lo}～{hi}" if lo and hi else (lo or hi)
+                      else:
+                          price, period = cell(7), cell(8)
+                      if price:
+                          parts.append("價格 " + price)
+                      if period:
+                          parts.append("期間 " + period)
+                      # 法定上限（td[5]）是依財報算出來的天花板，不是公司真的要買的錢，
+                      # 對進出場沒有意義，所以不放進畫面。原始值仍留在 p_raw。
+                      return "・".join(parts)
+
                   parsed = []
                   for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I):
                       td = [re.sub(r"<[^>]+>", "", x).replace("\xa0", " ").strip()
@@ -131,7 +177,7 @@ jobs:
                           "p_name": td[2],
                           "p_event_type": "buyback_board_resolution",
                           "p_event_date": roc2iso(td[3]),
-                          "p_summary": " | ".join(x for x in td[4:9] if x),
+                          "p_summary": build_summary(td, len(heads)),
                           "p_raw": {"cols": td},
                       })
                       info["inserted"] += 1
