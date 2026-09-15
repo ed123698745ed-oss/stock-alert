@@ -24,8 +24,10 @@ jobs:
           python3 - <<'PYEOF'
           import json, re, os, urllib.request, urllib.error, http.cookiejar, datetime
 
-          SUPA = os.environ["SUPABASE_URL"].rstrip("/")
-          KEY  = os.environ["SUPABASE_SERVICE_KEY"]
+          # GitHub Secret 貼上時很容易夾帶尾端換行，一定要 strip()。
+          # 沒 strip 的話 urllib 會噴 InvalidURL: URL can't contain control characters。
+          SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
           DAYS = int(os.environ.get("DAYS") or 30)
           UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
