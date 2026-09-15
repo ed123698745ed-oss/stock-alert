@@ -219,7 +219,7 @@ $("btnRun").onclick = () => window.open(GH, "_blank");
 // ---------- 載入 ----------
 async function load() {
   const until = iso(new Date(Date.now() + 400 * 864e5));
-  const [tmr, run, stg, cal, dsp, spl, det, ipo, pos, cbs] = await Promise.all([
+  const [tmr, run, stg, cal, dsp, spl, det, ipo, pos, cbs, lds] = await Promise.all([
     sb.from("v_tomorrow").select("*").order("sort_key"),
     sb.from("runs").select("*").order("started_at", { ascending: false }).limit(1),
     sb.from("strategies").select("*").order("name"),
@@ -232,8 +232,9 @@ async function load() {
     sb.from("v_ipos").select("*"),
     sb.from("v_positions").select("*"),
     sb.from("v_cb").select("*"),
+    sb.from("v_split_leads").select("*").limit(40),
   ]);
-  const err = [tmr, run, stg, cal, dsp, spl, det, ipo, pos, cbs].map(r => r.error).find(Boolean);
+  const err = [tmr, run, stg, cal, dsp, spl, det, ipo, pos, cbs, lds].map(r => r.error).find(Boolean);
   if (err) {
     $("actions").innerHTML = `<div class="card">讀取失敗：${esc(err.message)}</div>`;
     return;
@@ -251,7 +252,7 @@ async function load() {
   renderDisposals(dsp.data || []);
   renderIpos(ipo.data || []);
   renderCb(cbs.data || []);
-  renderSplit(spl.data || [], detSplit);
+  renderSplit(spl.data || [], detSplit, lds.data || []);
   renderPositions(POS.filter(r => r.strategy_code === "buyback"),
                   "buyback", "bbTitle", "庫藏股", BLOCKS.buyback.color);
   renderPositions(POS.filter(r => ["tw50", "msci"].includes(r.strategy_code)),
@@ -539,15 +540,17 @@ function renderCb(rows) {
 }
 
 // ---------- 分割策略（偵測公告 ＋ 六節點流程圖）----------
-function renderSplit(rows, det) {
+function renderSplit(rows, det, leads) {
   const box = $("split");
   const C = BLOCKS.split.color;
   // 已在追蹤清單裡的就不要在「待確認」再列一次
   const tracked = new Set(rows.map(r => r.company_code));
   const detections = det.filter(d => !tracked.has(d.company_code));
+  const L = leads || [];
+  const pending = detections.length + L.length;
   $("splitTitle").innerHTML = `分割策略${rows.length ? `　${rows.length}` : ""}` +
-    (detections.length ? `　<span style="color:${C}">待確認 ${detections.length}</span>` : "");
-  navCount("splitTitle", rows.filter(r => r.status !== "已完成").length + detections.length);
+    (pending ? `　<span style="color:${C}">待確認 ${pending}</span>` : "");
+  navCount("splitTitle", rows.filter(r => r.status !== "已完成").length + pending);
 
   // 1) 偵測到但還沒納入追蹤的公告
   const detHtml = detections.map(r => `
@@ -564,7 +567,26 @@ function renderSplit(rows, det) {
       </div>
     </div>`).join("");
 
-  if (!rows.length && !detections.length) {
+  // 分割線索：每小時掃重訊（主旨＋說明兩層判定）＋ 每日面額對帳
+  const leadHtml = L.map(r => `
+    <div class="card mini blkline" style="--c:${C}">
+      <span class="chip ${r.confidence === "強" ? "hot" : "warn"}">${esc(r.confidence)}命中</span>
+      <span class="chip on" style="--c:${C}">${esc(r.kind)}</span>
+      ${r.ratio ? `<span class="chip">一拆${r.ratio}</span>` : ""}
+      ${r.tracked ? `<span class="chip">已在追蹤</span>` : ""}
+      <div class="name" style="margin-top:8px">${esc(r.company_name || "")}
+        <span class="code">${esc(r.company_code)}</span>
+        <span class="code" style="font-size:12px">${esc(r.market || "")}・${fmt(r.lead_date)}</span></div>
+      <div class="subj">${esc(r.subject || "")}</div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" data-t="split_leads" data-f="handled"
+          data-id="${r.id}"> 已看過</label>
+        ${r.tracked ? "" : `<button class="small" data-addsplit="${esc(r.company_code)}"
+          data-name="${esc(r.company_name || "")}">加入追蹤</button>`}
+      </div>
+    </div>`).join("");
+
+  if (!rows.length && !detections.length && !L.length) {
     box.innerHTML = `<div class="empty">沒有追蹤中的分割標的。</div>`;
     return;
   }
@@ -581,7 +603,7 @@ function renderSplit(rows, det) {
     ["滿5日賣出", r.sell_date],
   ], C);
 
-  box.innerHTML = detHtml + rows.map(r => {
+  box.innerHTML = leadHtml + detHtml + rows.map(r => {
     const hot = String(r.status || "").startsWith("★");
     return `
     <div class="card blkline ${hot ? "soon" : ""}" style="--c:${C}">
