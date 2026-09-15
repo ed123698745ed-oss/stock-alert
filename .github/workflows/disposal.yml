@@ -3,8 +3,8 @@ name: 抓取處置股
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 11 * * 1-5'
-    - cron: '0 13 * * 1-5'
+    - cron: '10 10 * * 1-5'   # 台北 18:10
+    - cron: '40 12 * * 1-5'   # 台北 20:40（補跑）
 
 jobs:
   disposal:
@@ -27,7 +27,7 @@ jobs:
           CTX.verify_mode = ssl.CERT_NONE
 
           TODAY = datetime.date.today()
-          BACK, FWD = 60, 21
+          BACK, FWD = 60, 21          # ⚠️ endDate 必須往後推，否則「已公布、尚未開始」那批整批看不到
 
           def supa(path, payload=None, method="POST"):
               req = urllib.request.Request(
@@ -54,6 +54,7 @@ jobs:
                       if i + 1 < tries: time.sleep(wait * (i + 1))
               raise RuntimeError(f"{type(last).__name__}: {last}")
 
+          # ---------- 三種回應格式都吃 ----------
           def table_rows(raw):
               if isinstance(raw, list):
                   return raw
@@ -100,7 +101,34 @@ jobs:
                       v = str(CN.get(v, 2 if v == "兩" else v))
               return f"{v}分盤"
 
-          CODE_RE = re.compile(r"(?:[1-9]\d{3}|91\d{4})$")
+          CODE_RE = re.compile(r"(?:[1-9]\d{3}|91\d{4})$")   # 只留股票與 TDR，排除權證(六碼)與CB(五碼)
+
+          # ---------- 圈存（預收款券）：直接讀官方公告原文，兩種句型 ----------
+          #   大單：「…數量單筆達 10 交易單位或多筆累積達 30 交易單位以上時，應就…」
+          #   全部：「…該有價證券，應就其當日已委託之買賣，向該投資人收取全部…」
+          PREPAY_BIG = re.compile(r"單筆達\s*(\d+)\s*交易單位(?:.{0,10}?多筆累積達\s*(\d+)\s*交易單位)?")
+          PREPAY_ALL = re.compile(r"該有價證券\s*[，,]\s*應就其當日已委託")
+          CREDIT_RE  = re.compile(r"信用交易部分[，,]\s*則收足融資自備款或融券保證金")
+
+          def prepay_of(detail):
+              d = str(detail or "")
+              m = PREPAY_BIG.search(d)
+              if m:
+                  a, b = m.group(1), m.group(2)
+                  note = f"單筆達 {a} 交易單位"
+                  if b: note += f"、多筆累積達 {b} 交易單位"
+                  note += " 才預收"
+                  if CREDIT_RE.search(d): note += "；信用交易收足自備款／保證金"
+                  return ("大單", note)
+              if PREPAY_ALL.search(d):
+                  note = "全部委託都要預收款券"
+                  if CREDIT_RE.search(d): note += "；信用交易收足自備款／保證金"
+                  return ("全部", note)
+              return (None, None)
+
+          def int_or_none(v):
+              v = str(v or "").strip()
+              return int(v) if v.isdigit() else None
 
           def normalize(raw, market):
               out = []
@@ -108,6 +136,7 @@ jobs:
                   code = pick(r, "證券代號", "SecuritiesCompanyCode", "股票代號")
                   if not CODE_RE.fullmatch(code):
                       continue
+                  # 櫃買叫「處置起訖」、證交所叫「處置起迄」——不同字
                   period = pick(r, "處置起訖時間", "處置起迄時間", "DispositionPeriod", "處置期間")
                   parts = re.split(r"[～~至\-—]", period)
                   if len(parts) != 2:
@@ -117,9 +146,12 @@ jobs:
                       continue
                   ann_raw = pick(r, "公布日期", "Date", "公告日期")
                   name = pick(r, "證券名稱", "CompanyName", "股票名稱")
-                  name = re.split(r"[(（]", name)[0].strip()
+                  name = re.split(r"[(（]", name)[0].strip()   # 櫃買網站版名稱帶連結尾巴
                   detail = pick(r, "處置內容", "DisposalCondition", "處置措施")
+                  prepay, prepay_note = prepay_of(detail)
                   out.append({
+                      "prepay": prepay, "prepay_note": prepay_note,
+                      "cum": int_or_none(pick(r, "累計", "累計次數")),
                       "market": market, "code": code, "name": name,
                       "match_mode": matching(detail),
                       "announce": parse_date(ann_raw),
@@ -129,6 +161,7 @@ jobs:
                   })
               return out
 
+          # ---------- 三個來源 ----------
           d1 = (TODAY - datetime.timedelta(days=BACK)).strftime("%Y%m%d")
           d2 = (TODAY + datetime.timedelta(days=FWD)).strftime("%Y%m%d")
           SOURCES = [
@@ -153,7 +186,7 @@ jobs:
                   rows = normalize(get_json(url), market)
                   info["rows"] = len(rows)
                   for x in rows:
-                      merged[(x["code"], x["start"].isoformat())] = x
+                      merged[(x["code"], x["start"].isoformat())] = x   # 後抓的覆蓋先抓的
                   info["status"] = "success"
                   ok += 1
                   print(f"[{label}] {len(rows)} 筆")
@@ -171,6 +204,8 @@ jobs:
                       "p_announce": x["announce"].isoformat() if x["announce"] else None,
                       "p_start": x["start"].isoformat(), "p_end": x["end"].isoformat(),
                       "p_source": "官方公告", "p_is_fresh": x["fresh"], "p_raw": x["raw"],
+                      "p_prepay": x.get("prepay"), "p_prepay_note": x.get("prepay_note"),
+                      "p_cum": x.get("cum"),
                   })
                   n += 1
               except Exception as e:
@@ -189,13 +224,18 @@ jobs:
               print(f"  {s['source']}: {s['status']} 解析{s['rows']}筆"
                     + (f"  錯誤={s['error']}" if s['error'] else ""))
 
-          view = supa("v_disposals?select=company_code,company_name,match_mode,phase,grp,next_focus,is_focus"
+          view = supa("v_disposals?select=company_code,company_name,market,match_mode,phase,grp,"
+                      "next_focus,is_focus,prepay,cum_count,day_no,total_days,has_futures,has_mini"
                       "&order=grp,start_date.desc", method="GET")
           print(f"\n目前追蹤中 {len(view or [])} 檔：")
           for r in (view or []):
               star = "★" if r.get("is_focus") else " "
-              print(f"  {star} {r['company_code']} {r['company_name']}　{r.get('match_mode')}　"
-                    f"{r.get('grp')}／{r.get('phase')}　下個觀察 {r.get('next_focus') or '—'}")
+              fut = ("期" if r.get("has_futures") else "") + ("小期" if r.get("has_mini") else "")
+              day = (f"第{r['day_no']}/{r['total_days']}天" if r.get("day_no") else "")
+              print(f"  {star} {r['company_code']} {r['company_name']}　{r.get('market')}　"
+                    f"{r.get('match_mode')}　圈存:{r.get('prepay') or '—'}　累計{r.get('cum_count') or '?'}次　"
+                    f"{fut or '無期貨'}　{r.get('grp')}／{r.get('phase')} {day}　"
+                    f"下個觀察 {r.get('next_focus') or '—'}")
 
           if status == "failed":
               raise SystemExit(1)
