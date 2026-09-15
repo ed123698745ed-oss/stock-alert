@@ -1,18 +1,18 @@
-name: 分割線索掃描
+name: 面額對帳
 
-# 每小時跑一次。重訊可以在任何時間發布，原本一天只跑兩次
-# （18:20、20:50）會漏掉 21:00 之後才發的公告，隔天檔案換日就永久看不到了。
-# public repo 的 Actions 不計費，提高頻率沒有成本。
+# 每天一次就夠。這支是「最後一道防線」：不管公告漏成什麼樣，
+# 只要公司的普通股每股面額變了，就一定抓得到分割已經發生。
+# 重訊掃描交給 announcements.yml（它用 MOPS 全市場、含興櫃、還有 14 天回補）。
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 * * * *'
+    - cron: '30 0 * * *'   # 台北 08:30
 
 jobs:
   split-watch:
     runs-on: ubuntu-latest
     steps:
-      - name: 掃描分割線索（重訊每小時＋面額每日對帳）
+      - name: 面額日對帳（上市／上櫃／興櫃）
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -29,11 +29,7 @@ jobs:
           CTX.check_hostname = False
           CTX.verify_mode = ssl.CERT_NONE
 
-          MANUAL  = os.environ.get("EVENT_NAME") == "workflow_dispatch"
-          UTC_NOW = datetime.datetime.now(datetime.timezone.utc)
-          # 面額對帳一天做一次就夠：台北 08:00（= UTC 00:00）那一輪，
-          # 或手動觸發時一定做
-          DO_PAR  = MANUAL or UTC_NOW.hour == 0
+          MANUAL = os.environ.get("EVENT_NAME") == "workflow_dispatch"
 
           def supa(path, payload=None, method="POST"):
               req = urllib.request.Request(
@@ -95,93 +91,6 @@ jobs:
           sources = []
 
           # ==========================================================
-          #  A. 重大訊息掃描（每小時）
-          #     主旨和說明兩欄都比對，分兩級：
-          #       強 = 主旨本身含「面額」
-          #       中 = 主旨沒有，但說明含「面額」且含變更字樣
-          #     主旨有「章程」「股東常會」但說明沒有面額的一律不收
-          # ==========================================================
-          PAR_PAIR = re.compile(
-              r"面額.{0,12}?由\s*[「『\"]?\s*(?:新台幣)?\s*([\d.]+)\s*元?\s*[」』\"]?"
-              r"\s*(?:調整|變更)為\s*[「『\"]?\s*(?:新台幣)?\s*([\d.]+)")
-          CHANGE_RE = re.compile(r"變更|分割|拆股|換發新股|調整為")
-          REDUCE_RE = re.compile(r"減資")
-
-          def kind_of(subj):
-              s = subj or ""
-              if re.search(r"換發新股|換股基準日|停止買賣|最後交易日|新股上市", s): return "換股作業"
-              if re.search(r"股東常會|股東臨時會|股東會", s):                      return "股東會"
-              if re.search(r"章程", s):                                            return "章程變更"
-              if re.search(r"董事會|決議|面額", s):                                return "宣告拆股"
-              return "其他"
-
-          def ratio_of(text):
-              m = PAR_PAIR.search(text or "")
-              if not m: return (None, None, None)
-              try:
-                  a, b = float(m.group(1)), float(m.group(2))
-              except ValueError:
-                  return (None, None, None)
-              if a <= 0 or b <= 0: return (None, a or None, b or None)
-              r = round(a / b) if a > b else None
-              return (r if (r or 0) >= 2 else None, a, b)
-
-          ANN = [
-            ("上市", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L",
-             ("公司代號",), ("公司名稱",), ("主旨",), ("事實發生日",), ("發言日期",)),
-            ("上櫃", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O",
-             ("SecuritiesCompanyCode", "公司代號"), ("CompanyName", "公司名稱"),
-             ("主旨",), ("事實發生日",), ("發言日期", "Date")),
-          ]
-
-          total_hit = 0
-          for market, url, kcode, kname, ksubj, kfact, kspeak in ANN:
-              info = {"source": f"split_重訊_{market}", "status": "failed",
-                      "rows": 0, "inserted": 0, "error": None}
-              try:
-                  rows = get_json(url)
-                  info["rows"] = len(rows)
-                  n = 0
-                  for x in rows:
-                      subj   = pick(x, *ksubj)
-                      detail = pick(x, "說明")
-                      if not subj: continue
-
-                      strong = "面額" in subj
-                      medium = (not strong) and ("面額" in detail) and bool(CHANGE_RE.search(detail))
-                      if not (strong or medium): continue
-                      # 減資案常常也提到面額，但主旨沒寫面額的就不收，避免雜訊
-                      if REDUCE_RE.search(subj) and not strong: continue
-
-                      code = pick(x, *kcode)
-                      if not re.fullmatch(r"\d{4}", code): continue
-                      name = pick(x, *kname)
-                      d = roc(pick(x, *kfact)) or roc(pick(x, *kspeak))
-                      if not d: continue
-
-                      r, a, b = ratio_of(subj + " " + detail)
-                      supa("rpc/add_split_lead", {
-                          "p_code": code, "p_name": name, "p_market": market,
-                          "p_date": d.isoformat(), "p_kind": kind_of(subj),
-                          "p_confidence": "強" if strong else "中",
-                          "p_ratio": r, "p_par_from": a, "p_par_to": b,
-                          "p_subject": subj, "p_detail": detail[:2000],
-                          "p_source": f"重大訊息（{market}）"})
-                      n += 1
-                      print(f"  {'強' if strong else '中'} {code} {name} {d} "
-                            f"{kind_of(subj)}"
-                            + (f" 一拆{r}" if r else "")
-                            + f"　{subj[:60]}")
-                  info["inserted"] = n
-                  info["status"] = "success"
-                  total_hit += n
-                  print(f"[重訊 {market}] {len(rows)} 則，分割線索 {n} 筆")
-              except Exception as e:
-                  info["error"] = f"{type(e).__name__}: {e}"[:400]
-                  print(f"[重訊 {market}] ❌ {info['error']}")
-              sources.append(info)
-
-          # ==========================================================
           #  B. 面額對帳（每天一次）
           #     上市 t187ap03_L / 上櫃 mopsfin_t187ap03_O 都有「普通股每股面額」。
           #     跟前一天比對，面額變小就是分割已生效。這是事後確認，
@@ -190,13 +99,20 @@ jobs:
           # ==========================================================
           PAR_VAL = re.compile(r"新台幣\s*([\d.]+)\s*元")
 
-          if DO_PAR:
+          if True:
               BASIC = [
                 ("上市", "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
                  ("公司代號",), ("公司簡稱", "公司名稱"), ("普通股每股面額",)),
                 ("上櫃", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
                  ("SecuritiesCompanyCode", "公司代號"),
                  ("CompanyName", "公司簡稱", "公司名稱"),
+                 ("ParValueOfCommonStock", "普通股每股面額")),
+                # 興櫃：上市上櫃兩邊的重訊 OpenAPI 都沒有覆蓋興櫃，
+                # 但基本資料有，所以面額對帳是興櫃唯一的自動偵測管道。
+                # 實測 363 家，仁新 6696 顯示 1.0000 元（已從 10 元拆過）。
+                ("興櫃", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_R",
+                 ("SecuritiesCompanyCode", "公司代號"),
+                 ("CompanyAbbreviation", "CompanyName", "公司簡稱"),
                  ("ParValueOfCommonStock", "普通股每股面額")),
               ]
               for market, url, kcode, kname, kpar in BASIC:
@@ -229,8 +145,6 @@ jobs:
                       info["error"] = f"{type(e).__name__}: {e}"[:400]
                       print(f"[面額對帳 {market}] ❌ {info['error']}")
                   sources.append(info)
-          else:
-              print("（這一輪不做面額對帳，只在台北 08:00 那輪做）")
 
           ok = sum(1 for s in sources if s["status"] == "success")
           status = ("success" if ok == len(sources)
