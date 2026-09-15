@@ -387,10 +387,9 @@ function renderDisposals(rows) {
         ／共 ${r.total_days} 個交易日</div>
         <div class="bar"><i style="width:${pct}%"></i></div>`;
     }
-    // 圈存：直接來自官方公告原文，判不出來就不顯示，不猜
-    const prepay = r.prepay === "全部"
-      ? `<span class="chip hot">全部圈存</span>`
-      : (r.prepay === "大單" ? `<span class="chip warn">大單圈存</span>` : "");
+    // 圈存：只標「全部預收」那種（官方公告原文判定）。
+    // 大單門檻那種對實際下單影響不大，依 Ed 要求不顯示。
+    const prepay = r.prepay === "全部" ? `<span class="chip hot">圈存</span>` : "";
     const chips = `
       <div class="chips">
         ${r.match_mode ? `<span class="chip on">${esc(r.match_mode)}</span>` : ""}
@@ -413,10 +412,8 @@ function renderDisposals(rows) {
           style="${r.is_focus ? "" : "color:var(--dim)"};flex:none">${esc(r.phase || "")}</span>
       </div>
       ${chips}
-      <div class="meta">處置 ${fmt(r.start_date)} ～ ${fmt(r.end_date)}${
-        r.next_focus ? `　下個觀察 <b>${esc(r.next_focus)}</b>` : ""}</div>
+      <div class="meta">處置 ${fmt(r.start_date)} ～ ${fmt(r.end_date)}</div>
       ${progress}
-      ${r.prepay_note ? `<div class="meta" style="font-size:12px">${esc(r.prepay_note)}</div>` : ""}
       ${noteBlock("disposals", r)}
     </div>`;
   };
