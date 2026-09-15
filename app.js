@@ -297,7 +297,9 @@ function renderTomorrow(rows) {
   if (!rows.length) {
     $("actionTitle").textContent = "待辦";
     navCount("top", 0);
-    box.innerHTML = `<div class="empty">目前沒有要處理的事。</div>`;
+    box.innerHTML = `<div class="empty">目前沒有要處理的事。</div>
+      <h3 style="font-size:13px;color:var(--dim);margin:14px 0 8px;letter-spacing:.08em">今天　0</h3>
+      <div class="empty">本日無新增處置</div>`;
     return;
   }
   const order = { "未處理": 0, "今天": 1, "明天": 2 };
@@ -326,9 +328,17 @@ function renderTomorrow(rows) {
   };
 
   const head = { "未處理": "未處理（日子已經到了）", "今天": "今天", "明天": "明天" };
-  box.innerHTML = ["未處理", "今天", "明天"].filter(g => groups[g]).map(g =>
-    `<h3 style="font-size:13px;color:var(--dim);margin:14px 0 8px;letter-spacing:.08em">
-       ${head[g]}　${groups[g].length}</h3>${groups[g].map(card).join("")}`).join("");
+  // 「今天」這組一定要畫出來，就算沒事也要 —— 空白和「抓取失敗所以空白」
+  // 看起來一模一樣，要有一句話把兩者分開。
+  box.innerHTML = ["未處理", "今天", "明天"]
+    .filter(g => groups[g] || g === "今天").map(g => {
+      const list = groups[g] || [];
+      const noDisp = g === "今天" && !list.some(r => r.block_code === "disposal");
+      return `<h3 style="font-size:13px;color:var(--dim);margin:14px 0 8px;letter-spacing:.08em">
+       ${head[g]}　${list.length}</h3>${
+        noDisp ? `<div class="empty" style="margin-bottom:8px">本日無新增處置</div>` : ""
+      }${list.map(card).join("")}`;
+    }).join("");
   bindRows(box);
 }
 
@@ -390,16 +400,18 @@ function renderDisposals(rows) {
     }
     // 圈存：只標「全部預收」那種（官方公告原文判定）。
     // 大單門檻那種對實際下單影響不大，依 Ed 要求不顯示。
-    const prepay = r.prepay === "全部" ? `<span class="chip hot">圈存</span>` : "";
-    const chips = `
-      <div class="chips">
-        ${r.match_mode ? `<span class="chip on">${esc(r.match_mode)}</span>` : ""}
-        ${prepay}
-        <span class="chip ${r.has_futures ? "fut" : ""}">期貨${
-          r.has_futures && r.futures_contract ? " " + esc(r.futures_contract) : ""}</span>
-        <span class="chip ${r.has_mini ? "fut" : ""}">小型期${
-          r.has_mini && r.futures_contract_mini ? " " + esc(r.futures_contract_mini) : ""}</span>
-      </div>`;
+    // 標籤只在「有」的時候出現。沒有期貨、沒有小型期、不用圈存＝不顯示，
+    // 不再用灰框佔位 —— 一眼看到的框框都是要注意的事。
+    const tags = [];
+    if (r.match_mode) tags.push(`<span class="chip on">${esc(r.match_mode)}</span>`);
+    // 圈存只標「全部預收」那種（官方公告原文判定）。
+    // 大單門檻那種對實際下單影響不大，依 Ed 要求不顯示。
+    if (r.prepay === "全部") tags.push(`<span class="chip hot">圈存</span>`);
+    if (r.has_futures) tags.push(`<span class="chip fut">期貨${
+      r.futures_contract ? " " + esc(r.futures_contract) : ""}</span>`);
+    if (r.has_mini) tags.push(`<span class="chip fut">小型期${
+      r.futures_contract_mini ? " " + esc(r.futures_contract_mini) : ""}</span>`);
+    const chips = tags.length ? `<div class="chips">${tags.join("")}</div>` : "";
     return `
     <div class="card mini blkline ${r.is_focus ? "soon" : ""}" style="--c:${C}">
       <div class="dhead">
