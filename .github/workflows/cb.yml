@@ -1,1 +1,228 @@
+name: 抓取可轉債發行
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 10 * * 1-5'   # 台北 18:30
+    - cron: '30 13 * * 1-5'   # 台北 21:30（補跑）
+
+jobs:
+  cb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓可轉債發行資料並寫入 Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, ssl, time, datetime, urllib.request
+
+          SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
+          UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+          CTX  = ssl.create_default_context()
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          def supa(path, payload=None, method="POST"):
+              req = urllib.request.Request(
+                  f"{SUPA}/rest/v1/{path}",
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+                  headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
+                           "Content-Type": "application/json",
+                           "Prefer": "return=representation"},
+                  method=method)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  b = r.read()
+                  return json.loads(b) if b.strip() else None
+
+          def get_json(url, tries=3, wait=3):
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          "User-Agent": UA, "Accept": "application/json"})
+                      with urllib.request.urlopen(req, context=CTX, timeout=60) as r:
+                          txt = r.read().decode("utf-8", "replace")
+                      if txt.lstrip()[:1] not in "{[":
+                          raise ValueError("回傳不是 JSON（可能被擋）：" + txt[:120])
+                      return json.loads(txt)
+                  except Exception as e:
+                      last = e
+                      if i + 1 < tries: time.sleep(wait * (i + 1))
+              raise RuntimeError(f"{type(last).__name__}: {last}")
+
+          def ymd(s):
+              """20260918 → date"""
+              s = str(s or "").strip()
+              if len(s) == 8 and s.isdigit():
+                  try: return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:]))
+                  except ValueError: return None
+              return None
+
+          def roc(s):
+              """1150915 / 115/09/15 → date"""
+              n = re.findall(r"\d+", str(s or ""))
+              if len(n) == 3:
+                  y, m, d = map(int, n)
+              elif len(n) == 1 and len(n[0]) in (7, 8):
+                  v = n[0]; y, m, d = int(v[:-4]), int(v[-4:-2]), int(v[-2:])
+              else:
+                  return None
+              try: return datetime.date(y + 1911 if y < 1911 else y, m, d)
+              except ValueError: return None
+
+          def iso(d): return d.isoformat() if d else None
+
+          run = supa("runs", {"trigger": "schedule", "status": "running",
+                              "run_url": f"{os.environ.get('GITHUB_SERVER_URL','')}/"
+                                         f"{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/"
+                                         f"{os.environ.get('GITHUB_RUN_ID','')}"})[0]
+          sources = []
+
+          # ==========================================================
+          # 來源 A：櫃買 轉(交)換債發行資料　← 主來源
+          #   含未來掛牌日、轉換起始日、發行時轉換價、金額、擔保、承銷商
+          # ==========================================================
+          GUAR = {"1": "有擔保", "2": "無擔保"}
+          infoA = {"source": "cb_櫃買發行資料", "status": "failed",
+                   "rows": 0, "inserted": 0, "error": None}
+          try:
+              data = get_json("https://www.tpex.org.tw/openapi/v1/bond_ISSBD5_data")
+              infoA["rows"] = len(data)
+              n = 0
+              for x in data:
+                  g = lambda k: str(x.get(k) or "").strip()
+                  stock = g("IssuerCode").lstrip("0") or g("IssuerCode")
+                  if not stock:
+                      continue
+                  amt = g("IssueAmount")
+                  try:
+                      supa("rpc/upsert_cb_tpex", {
+                          "p_stock": stock,
+                          "p_stock_name": g("IssuerName") or None,
+                          "p_cb_code": g("BondCode"),
+                          "p_cb_name": g("ShortName") or None,
+                          "p_listing": iso(ymd(g("ListingDate"))),
+                          "p_convert_start": iso(ymd(g("Conversion/ExchangePeriodStartDate"))),
+                          "p_price": float(g("Conversion/ExchangePriceAtIssuance") or 0) or None,
+                          "p_amount": int(amt) if amt.isdigit() else None,
+                          "p_guaranteed": GUAR.get(g("Guaranteed")),
+                          "p_underwriter": g("Underwriter") or None,
+                          "p_issue_date": iso(ymd(g("IssueDate"))),
+                          "p_raw": {k: str(v)[:120] for k, v in x.items() if str(v).strip()},
+                      })
+                      n += 1
+                  except Exception as e:
+                      print(f"  寫入失敗 {stock} {g('BondCode')}: {e}")
+              infoA["inserted"] = n
+              infoA["status"] = "success"
+              print(f"[櫃買發行資料] {len(data)} 筆，寫入 {n} 筆")
+          except Exception as e:
+              infoA["error"] = f"{type(e).__name__}: {e}"[:400]
+              print(f"[櫃買發行資料] ❌ {infoA['error']}")
+          sources.append(infoA)
+
+          # ==========================================================
+          # 來源 B：MOPS 每日重大訊息 → 補董事會決議日與訂價日
+          #   抓不到不影響主流程，只會讓那兩格維持「待補」
+          # ==========================================================
+          CN = {"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10}
+          CB_RE    = re.compile(r"轉換公司債|可轉換公司債|轉(?:換|交換)公司債")
+          PRICE_RE = re.compile(r"轉換價格|訂定.*轉換價|轉換價.*調整")
+          BOARD_RE = re.compile(r"董事會|決議")
+          SERIES_RE = re.compile(r"第\s*([一二三四五六七八九十\d]+)\s*次")
+
+          def series_of(subj):
+              m = SERIES_RE.search(subj or "")
+              if not m: return None
+              v = m.group(1)
+              return f"第{v}次"
+
+          ANN = [
+            ("上市", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L",
+             "公司代號", "公司名稱", "主旨 ", "事實發生日", "發言日期"),
+            ("上櫃", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O",
+             "SecuritiesCompanyCode", "CompanyName", "主旨", "事實發生日", "發言日期"),
+          ]
+
+          for market, url, kcode, kname, ksubj, kfact, kspeak in ANN:
+              info = {"source": f"cb_重訊_{market}", "status": "failed",
+                      "rows": 0, "inserted": 0, "error": None}
+              try:
+                  rows = get_json(url)
+                  info["rows"] = len(rows)
+                  n = 0
+                  for x in rows:
+                      # 主旨欄名在 TWSE 版本尾端帶一個空格，兩種都試
+                      subj = str(x.get(ksubj) or x.get(ksubj.strip()) or
+                                 x.get(ksubj + " ") or "").strip()
+                      if not CB_RE.search(subj):
+                          continue
+                      code = str(x.get(kcode) or "").strip()
+                      name = str(x.get(kname) or "").strip()
+                      if not re.fullmatch(r"\d{4}", code):
+                          continue
+                      d = roc(x.get(kfact)) or roc(x.get(kspeak))
+                      if not d:
+                          continue
+
+                      if PRICE_RE.search(subj):
+                          supa("rpc/set_cb_pricing", {"p_stock": code, "p_pricing": iso(d)})
+                          print(f"  訂價 {code} {name} {d}　{subj[:50]}")
+                          n += 1
+                      elif BOARD_RE.search(subj):
+                          supa("rpc/upsert_cb_board", {
+                              "p_stock": code, "p_stock_name": name,
+                              "p_board": iso(d), "p_series": series_of(subj),
+                              "p_note": subj[:200]})
+                          print(f"  董事會 {code} {name} {d}　{subj[:50]}")
+                          n += 1
+                  info["inserted"] = n
+                  info["status"] = "success"
+                  print(f"[重訊 {market}] {len(rows)} 則，CB 相關寫入 {n} 筆")
+              except Exception as e:
+                  info["error"] = f"{type(e).__name__}: {e}"[:400]
+                  print(f"[重訊 {market}] ❌ {info['error']}")
+              sources.append(info)
+
+          # 把「只有董事會公告」的列併進已經有 CB 代號的那筆
+          try:
+              linked = supa("rpc/link_cb_board", {})
+              print(f"併入董事會日期 {linked} 筆")
+          except Exception as e:
+              print(f"link_cb_board 失敗: {e}")
+
+          ok = sum(1 for s in sources if s["status"] == "success")
+          # 主來源成功就算過關，重訊只是加分
+          status = ("success" if infoA["status"] == "success" and ok == len(sources)
+                    else ("partial" if infoA["status"] == "success" else "failed"))
+          supa(f"runs?id=eq.{run['id']}",
+               {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "status": status, "sources": sources}, method="PATCH")
+
+          print("=" * 56)
+          print(f"執行結果: {status}")
+          for s in sources:
+              print(f"  {s['source']}: {s['status']} 讀{s['rows']}筆 寫{s['inserted']}筆"
+                    + (f"  錯誤={s['error']}" if s["error"] else ""))
+
+          view = supa("v_cb?select=cb_code,cb_name,stock_code,stock_name,board_date,"
+                      "pricing_date,listing_date,convert_start,convert_price,amount_yi,"
+                      "guaranteed,status,grp", method="GET")
+          print(f"\n近期發行中的可轉債 {len(view or [])} 檔：")
+          for r in (view or []):
+              print(f"  {r.get('cb_code') or '(未掛牌)':8s} {str(r.get('cb_name') or ''):12s}"
+                    f" 正股 {r['stock_code']} {str(r.get('stock_name') or ''):10s}"
+                    f" {r.get('amount_yi') or '—'}億 {r.get('guaranteed') or ''}"
+                    f" 董事會 {r.get('board_date') or '—'}"
+                    f" 掛牌 {r.get('listing_date') or '—'}"
+                    f" 轉換起 {r.get('convert_start') or '—'}"
+                    f" 轉換價 {r.get('convert_price') or '—'}"
+                    f"　{r.get('status')}")
+
+          if status == "failed":
+              raise SystemExit(1)
+          PYEOF
