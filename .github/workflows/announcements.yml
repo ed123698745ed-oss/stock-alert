@@ -40,12 +40,21 @@ jobs:
           TODAY = datetime.date.today()
 
           # ---------- 三層判定的關鍵字 ----------
-          # 強：主旨本身就有這些字
-          SPLIT_KW = ["股票分割","股份分割","面額分割","股票面額","每股面額",
-                      "面額變更","換發新股","換股基準"]
-          SPLIT_EXCLUDE = ["減資","合併換股"]
-          # 中：主旨沒有，但說明欄有「面額」＋變更字樣（只有 OpenAPI 來源拿得到說明）
-          CHANGE_RE = re.compile(r"變更|分割|拆股|換發新股|調整為")
+          # 2026-09-15 修正：原本把「換股基準」放進強命中，結果
+          #   「訂定減資換股基準日及換股作業計畫」同時命中關鍵字和排除字，
+          #   排除被繞過，四檔減資案被當成分割（4118/4155/6108/8176）。
+          #   減資是股數變少、面額不動；分割是面額變小、股數變多，方向相反。
+          #
+          # 第一層 PAR_KW：面額專屬字眼。減資公告不會動到面額，所以這層天生安全。
+          PAR_KW  = ["股票分割","股份分割","面額分割","股票面額","每股面額",
+                     "面額變更","變更面額","票面金額"]
+          # 換股類字眼：真分割的換股公告一定寫「面額變更換發新股」，第一層就接走了，
+          # 所以這些字「不再單獨成立」，只有已經在追蹤清單的公司才算數。
+          SWAP_KW = ["換發新股","換股基準","換股作業","停止買賣","最後交易日","新股上市"]
+          # 否決字：主旨或說明碰到就丟掉（第一層的面額字眼優先，不受這裡影響）
+          VETO_KW = ["減資","合併","股份轉換","股份交換","認股權","員工認股","認股辦法",
+                     "限制員工權利新股","轉換公司債","可轉債","私募",
+                     "現金增資","盈餘轉增資","資本公積轉增資","庫藏股","銷除","註銷"]
           # 定向：公司已經在拆股流程中，主旨只要是這些就算數
           TARGET_RE = re.compile(r"股東常會|股東臨時會|股東會|章程|換發新股|換股|停止買賣|新股上市|最後交易日")
           PAR_PAIR = re.compile(
@@ -239,16 +248,37 @@ jobs:
           #    中   主旨沒有，但說明欄含「面額」＋變更字樣
           #    定向 公司已經在拆股流程中，主旨是股東會／章程／換股
           # ==========================================================
+          def hit(kws, s):
+              return next((k for k in kws if k in s), None)
+
           def classify(a):
-              subj, detail = a["subject"], a.get("detail") or ""
-              if any(k in subj for k in SPLIT_EXCLUDE) and not any(k in subj for k in SPLIT_KW):
+              subj   = a["subject"] or ""
+              detail = a.get("detail") or ""
+
+              # 第一層：主旨帶面額專屬字眼 → 強。這層不看否決字，
+              #         因為減資／合併／認股權的公告不會去改每股面額。
+              k = hit(PAR_KW, subj)
+              if k:
+                  return ("強", kind_of(subj), k)
+
+              # 否決：主旨有這些字就到此為止
+              if hit(VETO_KW, subj):
                   return (None, None, None)
-              if any(k in subj for k in SPLIT_KW):
-                  return ("強", kind_of(subj), next(k for k in SPLIT_KW if k in subj))
-              if detail and "面額" in detail and CHANGE_RE.search(detail):
-                  return ("中", kind_of(subj), "說明含面額")
-              if a["code"] in watch and TARGET_RE.search(subj):
+
+              # 第二層：說明欄推得出「面額由 X 元變更為 Y 元」的數字對才算，
+              #         不再只看「面額」兩個字（員工認股權的說明也會提到面額）。
+              if detail and not hit(VETO_KW, detail):
+                  r, _pa, _pb = ratio_of(subj + " " + detail)
+                  if r:
+                      return ("中", kind_of(subj), "說明推得出面額變更")
+                  if "面額" in detail and re.search(r"股票分割|股份分割|面額分割|拆股", detail):
+                      return ("中", kind_of(subj), "說明含分割")
+
+              # 第三層：已知在拆股流程中的公司，主旨碰到節點關鍵字就算。
+              #         換股類字眼只在這一層成立。
+              if a["code"] in watch and (hit(SWAP_KW, subj) or TARGET_RE.search(subj)):
                   return ("強", kind_of(subj), "定向追蹤")
+
               return (None, None, None)
 
           hits, n_lead, n_det = [], 0, 0
@@ -273,6 +303,7 @@ jobs:
                   n_lead += 1
               except Exception as e:
                   print(f"  線索寫入失敗 {a['code']}: {e}")
+
               # 原本的 detections 保留，網站舊區塊還在用
               if matched != "定向追蹤" and conf == "強":
                   try:
@@ -284,6 +315,7 @@ jobs:
                       n_det += 1
                   except Exception as e:
                       print(f"  detections 寫入失敗 {a['code']}: {e}")
+
               print(f"  [{tag}] {d} {a['code']} {a['name']}　{kind}"
                     + (f"　一拆{r}" if r else "")
                     + f"\n        {a['subject'][:74]}")
