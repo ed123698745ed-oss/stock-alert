@@ -82,6 +82,17 @@ function ensureSections() {
     .bar{height:6px;border-radius:99px;background:var(--line);margin-top:8px;overflow:hidden}
     .bar i{display:block;height:100%;background:#f59e0b}
 
+    /* 條件標籤（撮合／圈存／期貨）*/
+    .chips{display:flex;gap:5px;flex-wrap:wrap;margin:9px 0 2px}
+    .chip{font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;
+      border:1px solid var(--line);color:var(--dim);background:var(--bg);
+      letter-spacing:.03em}
+    .chip.on  {color:#fff;background:var(--c);border-color:var(--c)}
+    .chip.warn{color:#fff;background:#f59e0b;border-color:#f59e0b}
+    .chip.hot {color:#fff;background:var(--buy);border-color:var(--buy)}
+    .chip.fut {color:#fff;background:#6366f1;border-color:#6366f1}
+    .dhead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+
     /* 分割流程圖 */
     .flow{display:flex;margin:14px 0 2px}
     .step{flex:1 1 0;min-width:0;text-align:center;position:relative;padding-top:4px}
@@ -369,7 +380,6 @@ function renderDisposals(rows) {
     (groups[g] || []).sort((a, b) => String(b.start_date).localeCompare(String(a.start_date))));
 
   const card = r => {
-    const period = `處置 ${fmt(r.start_date)} ～ ${fmt(r.end_date)}`;
     let progress = "";
     if (r.grp === "處置中" && r.day_no && r.total_days) {
       const pct = Math.round(r.day_no / r.total_days * 100);
@@ -377,16 +387,36 @@ function renderDisposals(rows) {
         ／共 ${r.total_days} 個交易日</div>
         <div class="bar"><i style="width:${pct}%"></i></div>`;
     }
+    // 圈存：直接來自官方公告原文，判不出來就不顯示，不猜
+    const prepay = r.prepay === "全部"
+      ? `<span class="chip hot">全部圈存</span>`
+      : (r.prepay === "大單" ? `<span class="chip warn">大單圈存</span>` : "");
+    const chips = `
+      <div class="chips">
+        ${r.match_mode ? `<span class="chip on">${esc(r.match_mode)}</span>` : ""}
+        ${prepay}
+        <span class="chip ${r.has_futures ? "fut" : ""}">期貨${
+          r.has_futures && r.futures_contract ? " " + esc(r.futures_contract) : ""}</span>
+        <span class="chip ${r.has_mini ? "fut" : ""}">小型期${
+          r.has_mini && r.futures_contract_mini ? " " + esc(r.futures_contract_mini) : ""}</span>
+      </div>`;
     return `
     <div class="card mini blkline ${r.is_focus ? "soon" : ""}" style="--c:${C}">
-      <span class="tag ${r.is_focus ? "warn" : ""}" style="${r.is_focus ? "" : "color:var(--dim)"}">${esc(r.phase || "")}</span>
-      <span class="tag" style="color:var(--dim)">${esc(r.match_mode || "")}</span>
-      ${r.is_new ? `<span class="tag buy">新公告</span>` : ""}
-      <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span>
-        <span class="code" style="font-size:12px">${esc(r.market)}</span></div>
-      <div class="meta">${period}${
+      <div class="dhead">
+        <div>
+          <div class="name">${esc(r.company_name)} <span class="code">${esc(r.company_code)}</span></div>
+          <div class="meta" style="margin-top:2px">${esc(r.market)}${
+            r.cum_count ? `・累計 ${r.cum_count} 次` : ""}${
+            r.is_new ? `　<b style="color:var(--buy)">新公告</b>` : ""}</div>
+        </div>
+        <span class="tag ${r.is_focus ? "warn" : ""}"
+          style="${r.is_focus ? "" : "color:var(--dim)"};flex:none">${esc(r.phase || "")}</span>
+      </div>
+      ${chips}
+      <div class="meta">處置 ${fmt(r.start_date)} ～ ${fmt(r.end_date)}${
         r.next_focus ? `　下個觀察 <b>${esc(r.next_focus)}</b>` : ""}</div>
       ${progress}
+      ${r.prepay_note ? `<div class="meta" style="font-size:12px">${esc(r.prepay_note)}</div>` : ""}
       ${noteBlock("disposals", r)}
     </div>`;
   };
