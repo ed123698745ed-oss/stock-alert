@@ -1,0 +1,201 @@
+name: 更新股票期貨標的
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 14 * * 6'   # 台北 週日 22:00（每週一次就夠，標的變動很慢）
+
+jobs:
+  futures:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓期交所股票期貨標的清單
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          pip install --quiet lxml
+          python3 - <<'PYEOF'
+          import json, os, re, ssl, time, datetime, urllib.request, html as htmllib
+
+          SUPA = os.environ["SUPABASE_URL"].strip().rstrip("/")
+          KEY  = os.environ["SUPABASE_SERVICE_KEY"].strip()
+          UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+          CTX  = ssl.create_default_context()
+          CTX.check_hostname = False
+          CTX.verify_mode = ssl.CERT_NONE
+
+          def supa(path, payload=None, method="POST"):
+              req = urllib.request.Request(
+                  f"{SUPA}/rest/v1/{path}",
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+                  headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
+                           "Content-Type": "application/json",
+                           "Prefer": "return=representation"},
+                  method=method)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  b = r.read()
+                  return json.loads(b) if b.strip() else None
+
+          def get_html(url, tries=3):
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          "User-Agent": UA,
+                          "Accept": "text/html,application/xhtml+xml",
+                          "Referer": "https://www.taifex.com.tw/cht/index"})
+                      with urllib.request.urlopen(req, context=CTX, timeout=60) as r:
+                          raw = r.read()
+                      for enc in ("utf-8", "big5", "cp950"):
+                          try: return raw.decode(enc)
+                          except UnicodeDecodeError: continue
+                      return raw.decode("utf-8", "replace")
+                  except Exception as e:
+                      last = e
+                      if i + 1 < tries: time.sleep(4 * (i + 1))
+              raise RuntimeError(f"{type(last).__name__}: {last}")
+
+          TAG = re.compile(r"<[^>]+>")
+          def cells(row_html):
+              tds = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, re.S | re.I)
+              return [htmllib.unescape(TAG.sub("", c)).replace("　", " ").strip() for c in tds]
+
+          def rows_of(page):
+              return re.findall(r"<tr[^>]*>(.*?)</tr>", page, re.S | re.I)
+
+          CODE = re.compile(r"^\d{4}$")
+          found = {}   # code → {name, futures, mini, contract, contract_mini}
+
+          def note(code, name=None, contract=None, mini=False):
+              r = found.setdefault(code, {"name": None, "futures": False, "mini": False,
+                                          "contract": None, "contract_mini": None})
+              if name and not r["name"]: r["name"] = name
+              if mini:
+                  r["mini"] = True
+                  if contract: r["contract_mini"] = contract
+              else:
+                  r["futures"] = True
+                  if contract: r["contract"] = contract
+
+          sources = []
+
+          # ==========================================================
+          # A. 保證金一覽表－股票類（明細）　← 主來源
+          #    欄位：序號 / 股票期貨英文代碼 / 股票期貨標的證券代號 /
+          #          股票期貨中文簡稱 / 股票期貨標的證券 / 保證金級距…
+          #    中文簡稱以「小型」開頭 → 小型契約
+          # ==========================================================
+          infoA = {"source": "taifex_保證金明細", "status": "failed",
+                   "rows": 0, "inserted": 0, "error": None}
+          try:
+              page = get_html("https://www.taifex.com.tw/cht/5/stockMarginingDetail")
+              n = 0
+              for tr in rows_of(page):
+                  c = cells(tr)
+                  if len(c) < 5: continue
+                  # 找出「4 碼代號」那一格，其左邊是英文代碼、右邊是中文簡稱
+                  for i, v in enumerate(c):
+                      if CODE.fullmatch(v) and i >= 1 and i + 1 < len(c):
+                          contract = c[i - 1].strip()
+                          short    = c[i + 1].strip()
+                          if not re.fullmatch(r"[A-Z]{2,4}", contract): break
+                          note(v, name=short.replace("小型", "").replace("期貨", "") or None,
+                               contract=contract, mini=short.startswith("小型"))
+                          n += 1
+                          break
+              infoA["rows"] = n
+              infoA["status"] = "success"
+              print(f"[保證金明細] 解析 {n} 列")
+          except Exception as e:
+              infoA["error"] = f"{type(e).__name__}: {e}"[:400]
+              print(f"[保證金明細] ❌ {infoA['error']}")
+          sources.append(infoA)
+
+          # ==========================================================
+          # B. 股票期貨／選擇權交易標的　← 交叉驗證
+          #    欄位含：商品代碼 / 標的證券 / 證券代號 / 標的證券簡稱 /
+          #            是否為股票期貨標的 / … / 標準型證券股數（100=小型）
+          # ==========================================================
+          infoB = {"source": "taifex_交易標的", "status": "failed",
+                   "rows": 0, "inserted": 0, "error": None}
+          crossB = {}
+          try:
+              page = get_html("https://www.taifex.com.tw/cht/2/stockLists")
+              n = 0
+              for tr in rows_of(page):
+                  c = cells(tr)
+                  if len(c) < 6: continue
+                  idx = next((i for i, v in enumerate(c) if CODE.fullmatch(v)), None)
+                  if idx is None: continue
+                  code = c[idx]
+                  shares = next((v for v in c[idx + 1:] if re.fullmatch(r"[\d,]{3,}", v)), "")
+                  is_mini = shares.replace(",", "") == "100"
+                  crossB.setdefault(code, {"futures": False, "mini": False})
+                  if is_mini: crossB[code]["mini"] = True
+                  else:       crossB[code]["futures"] = True
+                  n += 1
+              infoB["rows"] = n
+              infoB["status"] = "success"
+              print(f"[交易標的] 解析 {n} 列")
+          except Exception as e:
+              infoB["error"] = f"{type(e).__name__}: {e}"[:400]
+              print(f"[交易標的] ❌ {infoB['error']}")
+          sources.append(infoB)
+
+          # ---------- 兩份表比對，只警告不阻擋 ----------
+          if crossB and found:
+              onlyA = set(found) - set(crossB)
+              onlyB = set(crossB) - set(found)
+              if onlyA or onlyB:
+                  print(f"⚠️ 兩份表不一致：只在保證金明細 {sorted(onlyA)[:10]}"
+                        f"　只在交易標的 {sorted(onlyB)[:10]}")
+              else:
+                  print("兩份表標的集合一致 ✓")
+              # 以聯集為準，避免任一份漏掉
+              for code, v in crossB.items():
+                  note(code, mini=False) if v["futures"] else None
+                  note(code, mini=True)  if v["mini"]    else None
+
+          run = supa("runs", {"trigger": "schedule", "status": "running",
+                              "run_url": f"{os.environ.get('GITHUB_SERVER_URL','')}/"
+                                         f"{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/"
+                                         f"{os.environ.get('GITHUB_RUN_ID','')}"})[0]
+
+          ok = 0
+          if found:
+              # 標的會下市或異動，先清空再重建
+              try:
+                  old = supa("rpc/reset_futures_underlying", {})
+                  print(f"清掉舊資料 {old} 筆")
+              except Exception as e:
+                  print(f"清空失敗（改為直接覆蓋）: {e}")
+              for code, v in sorted(found.items()):
+                  try:
+                      supa("rpc/upsert_futures_underlying", {
+                          "p_code": code, "p_name": v["name"],
+                          "p_futures": v["futures"], "p_mini": v["mini"],
+                          "p_contract": v["contract"], "p_contract_mini": v["contract_mini"]})
+                      ok += 1
+                  except Exception as e:
+                      print(f"  寫入失敗 {code}: {e}")
+
+          for s in sources:
+              s["inserted"] = ok if s["status"] == "success" else 0
+          status = ("success" if ok and all(s["status"] == "success" for s in sources)
+                    else ("partial" if ok else "failed"))
+          supa(f"runs?id=eq.{run['id']}",
+               {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "status": status, "sources": sources}, method="PATCH")
+
+          mini = sum(1 for v in found.values() if v["mini"])
+          print("=" * 56)
+          print(f"執行結果: {status}　標的 {len(found)} 檔（其中有小型契約 {mini} 檔），寫入 {ok} 檔")
+          print("\n有小型股票期貨的標的：")
+          print("  " + "、".join(f"{c} {v['name'] or ''}"
+                                for c, v in sorted(found.items()) if v["mini"]))
+
+          if status == "failed":
+              raise SystemExit(1)
+          PYEOF
