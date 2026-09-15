@@ -7,22 +7,27 @@ on:
         description: '回補幾天'
         required: false
         default: '14'
+  # 一天五次。原本只有兩次（18:20、20:50），雖然有 14 天回補不會永久漏掉，
+  # 但盤中發布的公告要等到晚上才看得到，白天多跑幾次可以早點知道。
   schedule:
-    - cron: '20 10 * * 1-5'
-    - cron: '50 12 * * 1-5'
+    - cron: '20 1 * * 1-5'    # 台北 09:20
+    - cron: '20 4 * * 1-5'    # 台北 12:20
+    - cron: '20 7 * * 1-5'    # 台北 15:20
+    - cron: '20 10 * * 1-5'   # 台北 18:20
+    - cron: '50 12 * * 1-5'   # 台北 20:50
 
 jobs:
   ann:
     runs-on: ubuntu-latest
     steps:
-      - name: 抓 MOPS ＋ OpenAPI 重大訊息，過濾分割關鍵字
+      - name: 抓 MOPS ＋ OpenAPI 重大訊息，三層判定分割線索
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DAYS: ${{ github.event.inputs.days || '14' }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, re, ssl, time, urllib.request, http.cookiejar, datetime
+          import json, os, re, ssl, time, urllib.request, urllib.error, http.cookiejar, datetime
           from html import unescape
           from concurrent.futures import ThreadPoolExecutor
 
@@ -34,9 +39,35 @@ jobs:
           CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
           TODAY = datetime.date.today()
 
+          # ---------- 三層判定的關鍵字 ----------
+          # 強：主旨本身就有這些字
           SPLIT_KW = ["股票分割","股份分割","面額分割","股票面額","每股面額",
                       "面額變更","換發新股","換股基準"]
           SPLIT_EXCLUDE = ["減資","合併換股"]
+          # 中：主旨沒有，但說明欄有「面額」＋變更字樣（只有 OpenAPI 來源拿得到說明）
+          CHANGE_RE = re.compile(r"變更|分割|拆股|換發新股|調整為")
+          # 定向：公司已經在拆股流程中，主旨只要是這些就算數
+          TARGET_RE = re.compile(r"股東常會|股東臨時會|股東會|章程|換發新股|換股|停止買賣|新股上市|最後交易日")
+          PAR_PAIR = re.compile(
+              r"面額.{0,12}?由\s*[「『\"]?\s*(?:新台幣)?\s*([\d.]+)\s*元?\s*[」』\"]?"
+              r"\s*(?:調整|變更)為\s*[「『\"]?\s*(?:新台幣)?\s*([\d.]+)")
+
+          def kind_of(subj):
+              s = subj or ""
+              if re.search(r"換發新股|換股基準|停止買賣|最後交易日|新股上市", s): return "換股作業"
+              if re.search(r"股東常會|股東臨時會|股東會", s):                    return "股東會"
+              if re.search(r"章程", s):                                          return "章程變更"
+              if re.search(r"董事會|決議|面額|分割", s):                          return "宣告拆股"
+              return "其他"
+
+          def ratio_of(text):
+              m = PAR_PAIR.search(text or "")
+              if not m: return (None, None, None)
+              try: a, b = float(m.group(1)), float(m.group(2))
+              except ValueError: return (None, None, None)
+              if a <= 0 or b <= 0: return (None, None, None)
+              r = round(a / b) if a > b else None
+              return (r if (r or 0) >= 2 else None, a, b)
 
           def supa(path, payload=None, method="POST"):
               req = urllib.request.Request(
@@ -45,9 +76,13 @@ jobs:
                   headers={"apikey": KEY, "Authorization": f"Bearer {KEY}",
                            "Content-Type": "application/json", "Prefer": "return=representation"},
                   method=method)
-              with urllib.request.urlopen(req, timeout=40) as r:
-                  b = r.read()
-                  return json.loads(b) if b.strip() else None
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      b = r.read()
+                      return json.loads(b) if b.strip() else None
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "replace")[:300]
+                  raise RuntimeError(f"HTTP {e.code} {path} → {body}") from None
 
           def clean(cell):
               return unescape(re.sub(r"<[^>]+>", " ", cell)).replace("\xa0"," ").replace("\r"," ")\
@@ -67,7 +102,7 @@ jobs:
               except ValueError: pass
               return None
 
-          # ---------- MOPS 歷史重大訊息（跨月拆查詢）----------
+          # ---------- MOPS 歷史重大訊息（TYPEK=all 是全市場，含興櫃）----------
           SESSION = {}
           def mops_opener():
               if "op" not in SESSION:
@@ -112,6 +147,7 @@ jobs:
               return jobs
 
           def parse_mops(html):
+              # MOPS 列表頁只有主旨，沒有說明欄 → detail 留空
               out = []
               for m in re.finditer(r"<tr\b[^>]*>(.*?)</tr>", html, re.S):
                   block = m.group(1)
@@ -124,27 +160,39 @@ jobs:
                   subject = max(cells, key=len) if cells else ""
                   ann = next((roc2date(c) for c in cells if roc2date(c)), None)
                   if subject:
-                      out.append({"code":code,"name":name,"subject":subject,"date":ann,"market":"sii"})
+                      out.append({"code":code,"name":name,"subject":subject,"detail":"",
+                                  "date":ann,"market":"sii","mk":None,"src":"MOPS"})
               return out
 
-          def parse_openapi(raw, market):
+          def parse_openapi(raw, market, mk):
+              # 這兩支有「說明」欄，是「中命中」唯一的資料來源
               out = []
               for r in raw or []:
                   code = str(r.get("公司代號") or r.get("SecuritiesCompanyCode") or "").strip()
                   if not re.fullmatch(r"\d{4}", code): continue
                   subject = str(r.get("主旨") or r.get("主旨 ") or "").strip()
                   if not subject: continue
+                  detail = str(r.get("說明") or r.get("說明 ") or "").strip()
                   out.append({"code":code,
                               "name":str(r.get("公司名稱") or r.get("CompanyName") or "").strip(),
-                              "subject":subject,
-                              "date": d7(r.get("發言日期")),
-                              "market": market})
+                              "subject":subject, "detail":detail,
+                              "date": d7(r.get("事實發生日")) or d7(r.get("發言日期")),
+                              "market": market, "mk": mk, "src":"OpenAPI"})
               return out
 
           def get_json(url):
               req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept":"application/json"})
               with urllib.request.urlopen(req, context=CTX, timeout=20) as r:
                   return json.loads(r.read().decode("utf-8","replace"))
+
+          # ---------- 已知在拆股流程中的公司（定向追蹤用）----------
+          watch = {}
+          try:
+              for w in (supa("v_split_missing?select=*", method="GET") or []):
+                  watch[w["company_code"]] = w
+              print(f"定向追蹤名單 {len(watch)} 家：{'、'.join(watch) or '（無）'}")
+          except Exception as e:
+              print(f"讀取定向名單失敗（不影響其他判定）: {e}")
 
           anns, seen, srcs = [], set(), []
 
@@ -162,16 +210,21 @@ jobs:
               info["error"] = f"{type(e).__name__}: {e}"[:300]
           srcs.append(info); print(f"[MOPS] {info['rows']} 則  {info['error'] or ''}")
 
-          for label, url, market in [
-              ("TWSE_t187ap04_L", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L", "sii"),
-              ("TPEx_t187ap04_O", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O", "otc")]:
+          for label, url, market, mk in [
+              ("TWSE_t187ap04_L", "https://openapi.twse.com.tw/v1/opendata/t187ap04_L", "sii", "上市"),
+              ("TPEx_t187ap04_O", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O", "otc", "上櫃")]:
               info = {"source":label,"status":"failed","rows":0,"error":None}
               try:
-                  got = parse_openapi(get_json(url), market)
+                  got = parse_openapi(get_json(url), market, mk)
                   n = 0
                   for a in got:
                       k = (a["code"], a["subject"][:40])
-                      if k in seen: continue
+                      if k in seen:
+                          # 同一則 MOPS 已經收過，但 OpenAPI 版本有說明欄 → 把說明補上去
+                          for prev in anns:
+                              if (prev["code"], prev["subject"][:40]) == k and not prev["detail"]:
+                                  prev["detail"] = a["detail"]; prev["mk"] = a["mk"]; break
+                          continue
                       seen.add(k); anns.append(a); n += 1
                   info["rows"] = n; info["status"] = "success"
               except Exception as e:
@@ -180,26 +233,72 @@ jobs:
 
           print(f"\n合計 {len(anns)} 則公告")
 
-          hits = [a for a in anns
-                  if any(k in a["subject"] for k in SPLIT_KW)
-                  and not any(k in a["subject"] for k in SPLIT_EXCLUDE)]
-          print(f"分割關鍵字命中 {len(hits)} 則")
+          # ==========================================================
+          #  三層判定
+          #    強   主旨本身含分割關鍵字
+          #    中   主旨沒有，但說明欄含「面額」＋變更字樣
+          #    定向 公司已經在拆股流程中，主旨是股東會／章程／換股
+          # ==========================================================
+          def classify(a):
+              subj, detail = a["subject"], a.get("detail") or ""
+              if any(k in subj for k in SPLIT_EXCLUDE) and not any(k in subj for k in SPLIT_KW):
+                  return (None, None, None)
+              if any(k in subj for k in SPLIT_KW):
+                  return ("強", kind_of(subj), next(k for k in SPLIT_KW if k in subj))
+              if detail and "面額" in detail and CHANGE_RE.search(detail):
+                  return ("中", kind_of(subj), "說明含面額")
+              if a["code"] in watch and TARGET_RE.search(subj):
+                  return ("強", kind_of(subj), "定向追蹤")
+              return (None, None, None)
 
-          n = 0
-          for a in hits:
-              kw = next((k for k in SPLIT_KW if k in a["subject"]), None)
+          hits, n_lead, n_det = [], 0, 0
+          for a in anns:
+              conf, kind, matched = classify(a)
+              if not conf: continue
+              hits.append((a, conf, kind, matched))
+
+          print(f"分割線索命中 {len(hits)} 則\n")
+          for a, conf, kind, matched in hits:
+              r, pa, pb = ratio_of(a["subject"] + " " + (a.get("detail") or ""))
+              d = a["date"] or TODAY
+              tag = "定向" if matched == "定向追蹤" else conf
               try:
-                  supa("rpc/add_detection", {
-                      "p_source":"announcements","p_market":a["market"],
-                      "p_code":a["code"],"p_name":a["name"],"p_subject":a["subject"][:500],
-                      "p_matched":kw,"p_strategy":"split",
-                      "p_announced_at": (a["date"].isoformat()+"T00:00:00+08:00") if a["date"] else None})
-                  n += 1
-                  print(f"  {a['date']} {a['code']} {a['name']}  [{kw}]  {a['subject'][:60]}")
+                  supa("rpc/add_split_lead", {
+                      "p_code": a["code"], "p_name": a["name"], "p_market": a.get("mk"),
+                      "p_date": d.isoformat(), "p_kind": kind, "p_confidence": conf,
+                      "p_ratio": r, "p_par_from": pa, "p_par_to": pb,
+                      "p_subject": a["subject"][:500],
+                      "p_detail": (a.get("detail") or "")[:2000],
+                      "p_source": f"重大訊息（{a['src']}／{matched}）"})
+                  n_lead += 1
               except Exception as e:
-                  print(f"  寫入失敗 {a['code']}: {e}")
+                  print(f"  線索寫入失敗 {a['code']}: {e}")
+              # 原本的 detections 保留，網站舊區塊還在用
+              if matched != "定向追蹤" and conf == "強":
+                  try:
+                      supa("rpc/add_detection", {
+                          "p_source":"announcements","p_market":a["market"],
+                          "p_code":a["code"],"p_name":a["name"],"p_subject":a["subject"][:500],
+                          "p_matched":matched,"p_strategy":"split",
+                          "p_announced_at": d.isoformat()+"T00:00:00+08:00"})
+                      n_det += 1
+                  except Exception as e:
+                      print(f"  detections 寫入失敗 {a['code']}: {e}")
+              print(f"  [{tag}] {d} {a['code']} {a['name']}　{kind}"
+                    + (f"　一拆{r}" if r else "")
+                    + f"\n        {a['subject'][:74]}")
 
-          print(f"\n寫入 detections {n} 則")
+          print(f"\n寫入 split_leads {n_lead} 則、detections {n_det} 則")
+
+          still = supa("v_split_missing?select=company_code,company_name,need_meeting,"
+                       "need_swap,need_listing", method="GET")
+          print(f"\n還在等節點的分割案 {len(still or [])} 家：")
+          for w in (still or []):
+              miss = "、".join(x for x, f in
+                               [("股東會", w["need_meeting"]), ("換股", w["need_swap"]),
+                                ("新股上市日", w["need_listing"])] if f)
+              print(f"  {w['company_code']} {w.get('company_name') or ''}　缺：{miss}")
+
           if not any(s["status"] == "success" for s in srcs):
               raise SystemExit(1)
           PYEOF
