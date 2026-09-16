@@ -249,7 +249,7 @@ async function load() {
   renderStatus(run.data?.[0]);
   renderTomorrow(tmr.data || []);
   renderCalendar(CAL);
-  renderDisposals(dsp.data || []);
+  renderDisposals((dsp.data || []).filter(r => r.grp !== "出關觀察"));  // Ed 不看出關
   renderIpos(ipo.data || []);
   renderCb(cbs.data || []);
   renderSplit(spl.data || [], detSplit, lds.data || []);
@@ -560,9 +560,12 @@ function renderSplit(rows, det, leads) {
   const detections = det.filter(d => !tracked.has(d.company_code));
   const L = leads || [];
   const pending = detections.length + L.length;
-  $("splitTitle").innerHTML = `分割策略${rows.length ? `　${rows.length}` : ""}` +
+  // 已完成（滿5日賣出已過）或勾了已處理 → 不佔版面，收進最下面摺疊區
+  const done = r => r.status === "已完成" || r.checked;
+  const shown = rows.filter(r => !done(r)), hidden = rows.filter(done);
+  $("splitTitle").innerHTML = `分割策略${shown.length ? `　${shown.length}` : ""}` +
     (pending ? `　<span style="color:${C}">待確認 ${pending}</span>` : "");
-  navCount("splitTitle", rows.filter(r => r.status !== "已完成").length + pending);
+  navCount("splitTitle", shown.length + pending);
 
   // 1) 偵測到但還沒納入追蹤的公告
   const detHtml = detections.map(r => `
@@ -615,7 +618,7 @@ function renderSplit(rows, det, leads) {
     ["滿5日賣出", r.sell_date],
   ], C);
 
-  box.innerHTML = leadHtml + detHtml + rows.map(r => {
+  const splitCard = r => {
     const hot = String(r.status || "").startsWith("★");
     return `
     <div class="card blkline ${hot ? "soon" : ""}" style="--c:${C}">
@@ -634,7 +637,10 @@ function renderSplit(rows, det, leads) {
       </div>
       ${noteBlock("split_watch", r)}
     </div>`;
-  }).join("");
+  };
+  box.innerHTML = leadHtml + detHtml + shown.map(splitCard).join("") +
+    (hidden.length ? `<details class="grp"><summary>已完成／已處理　${hidden.length} 檔</summary>
+      ${hidden.map(splitCard).join("")}</details>` : "");
 
   bindRows(box);
   box.querySelectorAll("[data-splitsave]").forEach(btn => {
@@ -760,7 +766,7 @@ function bindRows(box) {
 async function saveRow(table, id, patch, msg) {
   const { error } = await sb.from(table).update(patch).eq("id", id);
   toast(error ? "儲存失敗：" + error.message : (msg || "已同步"));
-  if (!error && (patch.handled || patch.done)) load();
+  if (!error && (patch.handled || patch.done || (table === "split_watch" && "checked" in patch))) load();
 }
 
 // ---------- 手動新增 ----------
